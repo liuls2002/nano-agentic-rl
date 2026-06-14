@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import tempfile
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -68,14 +69,30 @@ class PromptResponseTextTrainer(TextTrainer):
         )
 
 
-def load_veomni_args(config_path: str) -> VeOmniArguments:
-    """Parse a VeOmni YAML file after Monarch has installed rank variables."""
+def load_veomni_args(
+    config_path: str, veomni_config: dict[str, Any] | None = None
+) -> VeOmniArguments:
+    """Extract and parse VeOmni config after Monarch installs rank variables."""
+    if veomni_config is None:
+        with open(config_path, encoding="utf-8") as config_file:
+            raw_config = yaml.safe_load(config_file) or {}
+        veomni_config = raw_config.get("veomni")
+    if not isinstance(veomni_config, dict):
+        raise ValueError("veomni must be a mapping.")
+
+    parser_config = dict(veomni_config)
+    parser_config.pop("data_adapter", None)
     original_argv = sys.argv
-    try:
-        sys.argv = [original_argv[0], config_path]
-        return parse_args(VeOmniArguments)
-    finally:
-        sys.argv = original_argv
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", encoding="utf-8"
+    ) as config_file:
+        yaml.safe_dump(parser_config, config_file, sort_keys=False)
+        config_file.flush()
+        try:
+            sys.argv = [original_argv[0], config_file.name]
+            return parse_args(VeOmniArguments)
+        finally:
+            sys.argv = original_argv
 
 
 class TrainActor(Actor):
@@ -93,8 +110,12 @@ class TrainActor(Actor):
         with open(self.config_path, encoding="utf-8") as config_file:
             raw_config = yaml.safe_load(config_file) or {}
 
-        args = load_veomni_args(self.config_path)
-        adapter_config = raw_config.get("data_adapter")
+        veomni_config = raw_config.get("veomni")
+        if not isinstance(veomni_config, dict):
+            raise ValueError("veomni must be a mapping.")
+
+        args = load_veomni_args(self.config_path, veomni_config)
+        adapter_config = veomni_config.get("data_adapter")
         if adapter_config is None:
             self.trainer = TextTrainer(args)
         elif adapter_config.get("type") == "prompt_response":

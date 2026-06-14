@@ -46,17 +46,22 @@ def load_config(config_path: Path) -> dict[str, Any]:
 
 def get_worker_config(config: dict[str, Any]) -> tuple[int, dict[str, str], float]:
     monarch_config = config.get("monarch", {})
-    num_gpus = monarch_config.get("num_gpus", 1)
-    if not isinstance(num_gpus, int) or num_gpus < 1:
-        raise ValueError("monarch.num_gpus must be a positive integer.")
+    if not isinstance(monarch_config, dict):
+        raise ValueError("monarch must be a mapping.")
+    train_config = monarch_config.get("train", {})
+    if not isinstance(train_config, dict):
+        raise ValueError("monarch.train must be a mapping.")
 
-    gpu_ids = monarch_config.get("gpu_ids", list(range(num_gpus)))
-    if not isinstance(gpu_ids, list) or len(gpu_ids) != num_gpus:
-        raise ValueError("monarch.gpu_ids must contain exactly monarch.num_gpus entries.")
+    gpu_ids = train_config.get("gpu_ids", [0])
+    if not isinstance(gpu_ids, list) or not gpu_ids:
+        raise ValueError("monarch.train.gpu_ids must be a non-empty list.")
     if any(not isinstance(gpu_id, int) or gpu_id < 0 for gpu_id in gpu_ids):
-        raise ValueError("monarch.gpu_ids entries must be non-negative integers.")
+        raise ValueError(
+            "monarch.train.gpu_ids entries must be non-negative integers."
+        )
     if len(set(gpu_ids)) != len(gpu_ids):
-        raise ValueError("monarch.gpu_ids must not contain duplicates.")
+        raise ValueError("monarch.train.gpu_ids must not contain duplicates.")
+    num_gpus = len(gpu_ids)
 
     configured_env = monarch_config.get("env", {})
     if not isinstance(configured_env, dict):
