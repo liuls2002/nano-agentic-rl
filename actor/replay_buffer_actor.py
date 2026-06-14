@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+import logging
+import random
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Sequence
+
+import torch
+import yaml
+from monarch.actor import Actor, endpoint
+
+from rl.types import RLEpisode
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ReplayBufferStatus:
+    size: int
+    capacity: int
+    batch_size_per_rank: int
+    data_parallel_size: int
+    oldest_policy_version: int | None
+    newest_policy_version: int | None
+
+
+def _load_settings(config_path: str) -> dict[str, Any]:
+    with open(config_path, encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file) or {}
+    monarch = config.get("monarch", {})
+    if not isinstance(monarch, dict):
+        raise ValueError("monarch must be a mapping.")
+    rl_config = monarch.get("rl", {})
+    train_resources = monarch.get("train", {})
+    if not isinstance(rl_config, dict) or not isinstance(train_resources, dict):
+        raise ValueError("monarch.rl and monarch.train must be mappings.")
+    replay = rl_config.get("replay_buffer", {})
+    if not isinstance(replay, dict):
+        raise ValueError("monarch.rl.replay_buffer must be a mapping.")
+    gpu_ids = train_resources.get("gpu_ids", [])
+    if not isinstance(gpu_ids, list) or not gpu_ids:
+        raise ValueError("monarch.train.gpu_ids must be a non-empty list.")
+    return {
+        "capacity": int(replay.get("capacity", 256)),
+        "batch_size_per_rank": int(replay.get("batch_size_per_rank", 1)),
+        "max_policy_age": int(replay.get("max_policy_age", 0)),
+        "consume_samples": bool(replay.get("consume_samples", True)),
+        "seed": int(replay.get("seed", 0)),
+        "data_parallel_size": len(gpu_ids),
+        "prompt_length": int(rl_config.get("max_prompt_tokens", 448)),
+        "response_length": int(rl_config.get("max_response_tokens", 64)),
+        "mask_truncated": bool(rl_config.get("mask_truncated_responses", False)),
+    }
+
+
+class ReplayBufferActor(Actor):
+    """Store rollout episodes and collate one local batch per VeOmni rank."""
+
+    def __init__(self, config_path: str):
+        self.config_path = str(Path(config_path).expanduser().resolve())
+        self._buffer: deque[RLEpisode] = deque()
+        self._capacity = 0
+        self._batch_size_per_rank = 0
+        self._data_parallel_size = 0
+        self._max_policy_age = 0
+        self._consume_samples = True
+        self._prompt_length = 0
+        self._response_length = 0
+        self._mask_truncated = False
+        self._pad_token_id: int | None = None
+        self._rng = random.Random()
+
+    @endpoint
+    def setup(self, pad_token_id: int) -> ReplayBufferStatus:
+        if self._capacity:
+            raise RuntimeError("ReplayBufferActor.setup() may only be called once.")
+        settings = _load_settings(self.config_path)
+        for name in (
+            "capacity",
+            "batch_size_per_rank",
+            "data_parallel_size",
+            "prompt_length",
+            "response_length",
+        ):
+            if settings[name] <= 0:
+                raise ValueError(f"Replay buffer setting {name} must be positive.")
+
+        self._capacity = settings["capacity"]
+        self._batch_size_per_rank = settings["batch_size_per_rank"]
+        self._data_parallel_size = settings["data_parallel_size"]
+        self._max_policy_age = settings["max_policy_age"]
+        self._consume_samples = settings["consume_samples"]
+        self._prompt_length = settings["prompt_length"]
+        self._response_length = settings["response_length"]
+        self._mask_truncated = settings["mask_truncated"]
+        self._pad_token_id = int(pad_token_id)
+        self._buffer = deque(maxlen=self._capacity)
+        self._rng.seed(settings["seed"])
+        logger.info(
+            "ReplayBufferActor initialized: capacity=%d, batch=%d x DP=%d.",
+            self._capacity,
+            self._batch_size_per_rank,
+            self._data_parallel_size,
+        )
+        return self._status()
+
+    @endpoint
+    def add(self, episodes: Sequence[RLEpisode]) -> ReplayBufferStatus:
+        if not self._capacity:
+            raise RuntimeError("ReplayBufferActor.setup() must complete first.")
+        for episode in episodes:
+            episode.validate()
+            self._buffer.append(episode)
+        return self._status()
+
+    def _evict_stale(self, current_policy_version: int) -> None:
+        self._buffer = deque(
+            (
+                episode
+                for episode in self._buffer
+                if current_policy_version - episode.policy_version
+                <= self._max_policy_age
+            ),
+            maxlen=self._capacity,
+        )
+
+    def _collate(self, episodes: Sequence[RLEpisode]) -> dict[str, torch.Tensor]:
+        if self._pad_token_id is None:
+            raise RuntimeError("ReplayBufferActor.setup() must complete first.")
+        rows = [
+            episode.to_training_tensors(
+                prompt_length=self._prompt_length,
+                response_length=self._response_length,
+                pad_token_id=self._pad_token_id,
+                mask_truncated=self._mask_truncated,
+            )
+            for episode in episodes
+        ]
+        return {
+            key: torch.stack([row[key] for row in rows])
+            for key in (
+                "tokens",
+                "attention_mask",
+                "position_ids",
+                "generator_logprobs",
+                "loss_mask",
+                "advantages",
+            )
+        }
+
+    @endpoint
+    def sample(self, current_policy_version: int) -> list[dict[str, torch.Tensor]] | None:
+        if not self._capacity:
+            raise RuntimeError("ReplayBufferActor.setup() must complete first.")
+        self._evict_stale(int(current_policy_version))
+        total_size = self._batch_size_per_rank * self._data_parallel_size
+        if len(self._buffer) < total_size:
+            return None
+
+        indices = sorted(self._rng.sample(range(len(self._buffer)), total_size))
+        episodes = [self._buffer[index] for index in indices]
+        if self._consume_samples:
+            selected = set(indices)
+            self._buffer = deque(
+                (
+                    episode
+                    for index, episode in enumerate(self._buffer)
+                    if index not in selected
+                ),
+                maxlen=self._capacity,
+            )
+
+        return [
+            self._collate(
+                episodes[
+                    rank * self._batch_size_per_rank :
+                    (rank + 1) * self._batch_size_per_rank
+                ]
+            )
+            for rank in range(self._data_parallel_size)
+        ]
+
+    def _status(self) -> ReplayBufferStatus:
+        versions = [episode.policy_version for episode in self._buffer]
+        return ReplayBufferStatus(
+            size=len(self._buffer),
+            capacity=self._capacity,
+            batch_size_per_rank=self._batch_size_per_rank,
+            data_parallel_size=self._data_parallel_size,
+            oldest_policy_version=min(versions) if versions else None,
+            newest_policy_version=max(versions) if versions else None,
+        )
+
+    @endpoint
+    def get_status(self) -> ReplayBufferStatus:
+        return self._status()
+
+    @endpoint
+    def clear(self) -> None:
+        self._buffer.clear()

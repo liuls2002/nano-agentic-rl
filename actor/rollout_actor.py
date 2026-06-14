@@ -262,6 +262,13 @@ class RolloutActor(Actor):
         self._sampling_params_type: Any | None = None
         self._request_output_kind: Any | None = None
         self._default_sampling_config: dict[str, Any] = {}
+        self._max_prompt_tokens = 512
+        self._max_response_tokens = 256
+        self._max_model_len = 768
+        self._weight_transfer_initialized = False
+        self._weight_transfer_packed = True
+        self._weight_transfer_buffer_size = 256 * 1024 * 1024
+        self._weight_transfer_num_buffers = 2
         self._lock = asyncio.Lock()
 
     def _require_llm(self) -> Any:
@@ -277,6 +284,10 @@ class RolloutActor(Actor):
         sampling_config = dict(self._default_sampling_config)
         sampling_config.update(_require_mapping(overrides, "sampling_params"))
         params = self._sampling_params_type(**sampling_config)
+        if int(params.max_tokens) > self._max_response_tokens:
+            raise ValueError(
+                f"sampling max_tokens cannot exceed {self._max_response_tokens}."
+            )
         params.output_kind = self._request_output_kind.FINAL_ONLY
         return params
 
@@ -311,6 +322,27 @@ class RolloutActor(Actor):
             _apply_environment(config)
             engine_kwargs = _build_engine_kwargs(config)
             self._default_sampling_config = _build_default_sampling_config(config)
+            monarch_config = _require_mapping(config.get("monarch"), "monarch")
+            rl_config = _require_mapping(monarch_config.get("rl"), "monarch.rl")
+            self._max_prompt_tokens = int(rl_config.get("max_prompt_tokens", 512))
+            self._max_response_tokens = int(
+                rl_config.get("max_response_tokens", 256)
+            )
+            weight_sync_config = _require_mapping(
+                rl_config.get("weight_sync"), "monarch.rl.weight_sync"
+            )
+            self._weight_transfer_packed = bool(
+                weight_sync_config.get("packed", True)
+            )
+            self._weight_transfer_buffer_size = int(
+                weight_sync_config.get(
+                    "packed_buffer_size_bytes", 256 * 1024 * 1024
+                )
+            )
+            self._weight_transfer_num_buffers = int(
+                weight_sync_config.get("packed_num_buffers", 2)
+            )
+            self._max_model_len = int(engine_kwargs.get("max_model_len", 0))
 
             # Import after applying environment variables because vLLM reads many
             # runtime settings during module import and engine construction.
@@ -338,6 +370,16 @@ class RolloutActor(Actor):
             )
             return self._status()
 
+    def _make_tokenize_params(self, sampling_params: Any) -> Any:
+        from vllm.renderers.params import TokenizeParams
+
+        return TokenizeParams(
+            max_total_tokens=self._max_model_len,
+            max_output_tokens=int(sampling_params.max_tokens),
+            truncate_prompt_tokens=self._max_prompt_tokens,
+            truncation_side="left",
+        )
+
     @endpoint
     async def generate(
         self,
@@ -353,14 +395,14 @@ class RolloutActor(Actor):
             llm = self._require_llm()
             policy_version = self.policy_version
             started_at = time.perf_counter()
+            resolved_sampling_params = self._make_sampling_params(sampling_params)
             engine_prompts = await llm.renderer.render_cmpl_async(
-                [{"prompt": prompt} for prompt in normalized_prompts]
+                [{"prompt": prompt} for prompt in normalized_prompts],
+                self._make_tokenize_params(resolved_sampling_params),
             )
             request_outputs = await asyncio.gather(
                 *(
-                    self._generate_one(
-                        prompt, self._make_sampling_params(sampling_params)
-                    )
+                    self._generate_one(prompt, resolved_sampling_params)
                     for prompt in engine_prompts
                 )
             )
@@ -394,6 +436,8 @@ class RolloutActor(Actor):
             policy_version = self.policy_version
             from vllm.renderers.params import ChatParams
 
+            resolved_sampling_params = self._make_sampling_params(sampling_params)
+
             _, engine_prompts = await llm.renderer.render_chat_async(
                 normalized_conversations,
                 ChatParams(
@@ -404,12 +448,11 @@ class RolloutActor(Actor):
                         "tokenize": False,
                     }
                 ),
+                self._make_tokenize_params(resolved_sampling_params),
             )
             request_outputs = await asyncio.gather(
                 *(
-                    self._generate_one(
-                        prompt, self._make_sampling_params(sampling_params)
-                    )
+                    self._generate_one(prompt, resolved_sampling_params)
                     for prompt in engine_prompts
                 )
             )
@@ -454,6 +497,12 @@ class RolloutActor(Actor):
             else:
                 import torch
 
+                if os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION") != "1":
+                    raise RuntimeError(
+                        "In-memory vLLM weight updates require "
+                        "VLLM_ALLOW_INSECURE_SERIALIZATION=1 in the trusted "
+                        "rollout process environment."
+                    )
                 weights = []
                 for name, tensor in state_dict.items():
                     if not isinstance(name, str):
@@ -466,7 +515,12 @@ class RolloutActor(Actor):
                 if not weights:
                     raise ValueError("state_dict must contain at least one tensor.")
                 reload_kwargs = {
-                    "weights_iterator": weights,
+                    # AsyncLLM sends utility RPC arguments through an untyped
+                    # msgpack boundary. A plain list would encode each tensor as
+                    # [dtype, shape, buffer_index] without restoring its type.
+                    # list_iterator uses vLLM's trusted pickle fallback and keeps
+                    # the contained torch.Tensor objects intact.
+                    "weights_iterator": iter(weights),
                     "is_checkpoint_format": bool(is_checkpoint_format),
                 }
                 source = "state_dict"
@@ -489,6 +543,122 @@ class RolloutActor(Actor):
                 "Updated rollout weights to policy v%s from %s in %.2fs.",
                 result.policy_version,
                 result.source,
+                result.elapsed_seconds,
+            )
+            return result
+
+    @endpoint
+    async def init_weight_transfer(
+        self, master_address: str, master_port: int, world_size: int
+    ) -> None:
+        """Join vLLM workers to the trainer-owned NCCL transfer group."""
+        async with self._lock:
+            if self._weight_transfer_initialized:
+                raise RuntimeError(
+                    "RolloutActor weight transfer is already initialized."
+                )
+            if world_size <= 1:
+                raise ValueError(
+                    "NCCL weight-transfer world_size must be greater than one."
+                )
+
+            from vllm.distributed.weight_transfer.base import (
+                WeightTransferInitRequest,
+            )
+
+            await self._require_llm().init_weight_transfer_engine(
+                WeightTransferInitRequest(
+                    init_info={
+                        "master_address": str(master_address),
+                        "master_port": int(master_port),
+                        "rank_offset": 1,
+                        "world_size": int(world_size),
+                    }
+                )
+            )
+            self._weight_transfer_initialized = True
+            logger.info("vLLM workers joined the NCCL weight-transfer group.")
+
+    @endpoint
+    async def receive_weights(
+        self,
+        metadata: Mapping[str, Any],
+        *,
+        version: int | None = None,
+    ) -> WeightUpdateResult:
+        """Receive one HF-format policy update directly from the trainer GPUs."""
+        async with self._lock:
+            if not self._weight_transfer_initialized:
+                raise RuntimeError(
+                    "RolloutActor.init_weight_transfer() must complete first."
+                )
+            names = list(metadata.get("names", []))
+            dtype_names = list(metadata.get("dtype_names", []))
+            shapes = [list(shape) for shape in metadata.get("shapes", [])]
+            if (
+                not names
+                or len(names) != len(dtype_names)
+                or len(names) != len(shapes)
+            ):
+                raise ValueError(
+                    "Weight metadata names, dtype_names, and shapes must be non-empty "
+                    "lists of equal length."
+                )
+
+            from vllm.distributed.weight_transfer.base import (
+                WeightTransferUpdateRequest,
+            )
+
+            llm = self._require_llm()
+            next_version = self._next_policy_version(version)
+            started_at = time.perf_counter()
+            update_started = False
+            paused = False
+            try:
+                await llm.pause_generation(mode="abort")
+                paused = True
+                await llm.start_weight_update(is_checkpoint_format=True)
+                update_started = True
+                await llm.update_weights(
+                    WeightTransferUpdateRequest(
+                        update_info={
+                            "names": names,
+                            "dtype_names": dtype_names,
+                            "shapes": shapes,
+                            "packed": self._weight_transfer_packed,
+                            "packed_buffer_size_bytes": (
+                                self._weight_transfer_buffer_size
+                            ),
+                            "packed_num_buffers": self._weight_transfer_num_buffers,
+                        }
+                    )
+                )
+                await llm.finish_weight_update()
+                update_started = False
+                if not await llm.reset_prefix_cache():
+                    logger.warning("vLLM reported that the prefix cache was not reset.")
+                self.policy_version = next_version
+            finally:
+                if update_started:
+                    try:
+                        await llm.finish_weight_update()
+                    except Exception:
+                        logger.exception(
+                            "Failed to finish an interrupted weight update."
+                        )
+                if paused:
+                    await llm.resume_generation()
+
+            result = WeightUpdateResult(
+                policy_version=next_version,
+                source="nccl",
+                num_tensors=len(names),
+                elapsed_seconds=time.perf_counter() - started_at,
+            )
+            logger.info(
+                "Received %d policy tensors over NCCL for policy v%d in %.2fs.",
+                len(names),
+                next_version,
                 result.elapsed_seconds,
             )
             return result
@@ -521,6 +691,7 @@ class RolloutActor(Actor):
             self.llm = None
             self._sampling_params_type = None
             self._request_output_kind = None
+            self._weight_transfer_initialized = False
             try:
                 async_tokenizer = getattr(llm.renderer, "_async_tokenizer", None)
                 tokenizer_tasks = list(

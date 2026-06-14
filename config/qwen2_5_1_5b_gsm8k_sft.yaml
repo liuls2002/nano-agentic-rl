@@ -9,6 +9,39 @@ monarch:
   rollout:
     # vLLM consumes DP x TP x PP GPUs from this visible-device list.
     gpu_ids: [2, 3]
+  rl:
+    # Controller-level GRPO settings. main_rl.py performs one rollout/train/sync
+    # cycle per step; SFT ignores this section.
+    max_steps: 1000
+    weight_sync:
+      # Trainer rank 0 broadcasts FSDP-gathered parameters directly to all
+      # vLLM workers. No checkpoint is written on the rollout hot path.
+      backend: nccl
+      packed: true
+      packed_buffer_size_bytes: 268435456 # 256 MiB
+      packed_num_buffers: 2
+    rollout_batch_size: 2
+    max_rollout_groups_per_step: 32
+    max_prompt_tokens: 512
+    max_response_tokens: 256
+    clip_low: 0.2
+    clip_high: 0.28
+    drop_low_variance_groups: true
+    mask_truncated_responses: false
+    reward:
+      correctness_weight: 1.0
+      format_weight: 0.0
+      tolerance: 1.0e-6
+    advantage:
+      epsilon: 1.0e-4
+      minimum_group_std: 1.0e-3
+    replay_buffer:
+      # Four samples on each of two VeOmni ranks consume one 8-sample GRPO group.
+      batch_size_per_rank: 8
+      capacity: 256
+      max_policy_age: 0
+      consume_samples: true
+      seed: 42
 
 veomni:
   data_adapter:
@@ -36,7 +69,8 @@ veomni:
     train_path: /ssd/liuls/data/hub/gsm8k/main/train-00000-of-00001.parquet
     datasets_type: mapping
     data_type: conversation
-    max_seq_len: 512
+    # Training sequence contains at most 512 prompt + 256 response tokens.
+    max_seq_len: 768
     dataloader:
       type: native
       num_workers: 0
@@ -46,7 +80,7 @@ veomni:
   train:
     dyn_bsz: false
     micro_batch_size: 1
-    global_batch_size: 2
+    global_batch_size: 16
     num_train_epochs: 1
     max_steps: 100
     init_device: meta
@@ -89,14 +123,18 @@ vllm:
     model: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
     tokenizer: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
     dtype: bfloat16
-    max_model_len: 1024
-    gpu_memory_utilization: 0.5
+    # Exact rollout context budget: 512 prompt + 256 generated tokens.
+    max_model_len: 768
+    gpu_memory_utilization: 0.8
     enforce_eager: true # close torch.compile and CUDA graph
+    # Enable vLLM's native NCCL receiver used by main_rl.py.
+    weight_transfer_config:
+      backend: nccl
     seed: 42
   sampling:
     # Number of responses per prompt; this becomes the GRPO group size.
-    n: 2
-    max_tokens: 64
-    temperature: 0.8
+    n: 8
+    max_tokens: 256
+    temperature: 1.0
     top_p: 0.95
     logprobs: 1
