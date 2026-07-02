@@ -5,37 +5,37 @@ monarch:
     NCCL_IB_DISABLE: "1"
 
 
-# rl:
-#   # Controller-level GRPO settings. main_rl.py performs one rollout/train/sync cycle per step; SFT ignores this section.
-#   max_steps: 1000
-#   weight_sync:
-#     # Trainer rank 0 broadcasts FSDP-gathered parameters directly to all vLLM workers.
-#     backend: nccl
-#     packed: true
-#     packed_buffer_size_bytes: 536870912 # 512 MiB
-#     packed_num_buffers: 2
-#   rollout_batch_size: 2
-#   max_rollout_groups_per_step: 32
-#   max_prompt_tokens: 1024
-#   max_response_tokens: 1024
-#   clip_low: 0.2
-#   clip_high: 0.28
-#   drop_low_variance_groups: true
-#   mask_truncated_responses: false
-#   reward:
-#     correctness_weight: 1.0
-#     format_weight: 0.0
-#     tolerance: 1.0e-6
-#   advantage:
-#     epsilon: 1.0e-4
-#     minimum_group_std: 1.0e-3
-#   replay_buffer:
-#     # Four samples on each of two VeOmni ranks consume one 8-sample GRPO group.
-#     batch_size_per_rank: 8
-#     capacity: 256
-#     max_policy_age: 0
-#     consume_samples: true
-#     seed: 42
+rl:
+  # Controller-level GRPO settings. main_rl.py performs one rollout/train/sync cycle per step; SFT ignores this section.
+  max_steps: 1000
+  weight_sync:
+    # Trainer rank 0 broadcasts FSDP-gathered parameters directly to all vLLM workers.
+    backend: nccl
+    packed: true
+    packed_buffer_size_bytes: 536870912 # 512 MiB
+    packed_num_buffers: 2
+  rollout_batch_size: 2
+  max_rollout_groups_per_step: 32
+  max_prompt_tokens: 1024
+  max_response_tokens: 1024
+  clip_low: 0.2
+  clip_high: 0.28
+  drop_low_variance_groups: true
+  mask_truncated_responses: false
+  reward:
+    correctness_weight: 1.0
+    format_weight: 0.0
+    tolerance: 1.0e-6
+  advantage:
+    epsilon: 1.0e-4
+    minimum_group_std: 1.0e-3
+  replay_buffer:
+    # Four samples on each of two VeOmni ranks consume one 8-sample GRPO group.
+    batch_size_per_rank: 16
+    capacity: 256
+    max_policy_age: 0
+    consume_samples: true
+    seed: 42
 
 
 dataloader:
@@ -58,7 +58,7 @@ dataloader:
 
 train_actor:
   backend: veomni
-  num_gpus: 4
+  num_gpus: 2
   model:
     model_path: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
     tokenizer_path: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
@@ -76,10 +76,10 @@ train_actor:
   
   train:
     dyn_bsz: false
-    micro_batch_size: 2
-    global_batch_size: 64
-    num_train_epochs: 3
-    max_steps: 1000000
+    micro_batch_size: 1
+    global_batch_size: 32
+    num_train_epochs: 1
+    max_steps: 1000
     init_device: meta
     seed: 42
     accelerator:
@@ -93,14 +93,14 @@ train_actor:
       enable: false
     optimizer:
       type: adamw
-      lr: 1.0e-5
+      lr: 1.0e-6
       lr_warmup_ratio: 0.0
       lr_decay_style: constant
       lr_decay_ratio: 1.0
       weight_decay: 0.1
       max_grad_norm: 1.0
     checkpoint:
-      output_dir: outputs/qwen2_5_1_5b_gsm8k_grpo
+      output_dir: outputs/qwen2_5_1_5b_gsm8k_sft
       save_steps: 0
       save_epochs: 0
       hf_save_steps: 0
@@ -112,12 +112,12 @@ train_actor:
 
 rollout_actor:
   backend: vllm
-  num_gpus: 2
+  num_gpus: 4
   colocate: False
   
   initial_policy_version: 0
   engine:
-    data_parallel_size: 2
+    data_parallel_size: 4
     data_parallel_backend: mp
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
@@ -133,18 +133,18 @@ rollout_actor:
       backend: nccl
     seed: 42
   
-  # rollout: 
-  #   max_prompt_tokens: 1024
-  #   max_response_tokens: 1024
-  #   sampling:
-  #     n: 8    # grpo
-  #     max_tokens: 1024
-  #     temperature: 1.0
-  #     top_p: 0.95
-  #     logprobs: 1
+  rollout: 
+    max_prompt_tokens: 1024
+    max_response_tokens: 1024
+    sampling:
+      n: 8    # grpo
+      max_tokens: 1024
+      temperature: 1.0
+      top_p: 0.95
+      logprobs: 1
   
   eval:
-    eval_steps: 20
+    eval_steps: 2
     eval_epochs: 1
     batch_size: 2048
     sampling:

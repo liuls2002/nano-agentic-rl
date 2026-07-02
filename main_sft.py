@@ -4,23 +4,19 @@ import argparse
 import asyncio
 import logging
 import os
-import signal
+import socket
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Mapping, Sequence
 
-import monarch.actor as monarch_actor
 import yaml
-from monarch.actor import (
-    Actor,
-    MeshFailure,
-    ProcMesh,
-    endpoint,
-    shutdown_context,
-    this_host,
-)
+from monarch.actor import Actor, ProcMesh, endpoint, shutdown_context, this_host
 from monarch.spmd import setup_torch_elastic_env_async
 
+from actor.dataset_actor import DatasetActor
+from actor.reward_advantage_actor import RewardActor
+from actor.rollout_actor import RolloutActor
 from actor.train_actor import TrainActor
+from tools.eval_metrics import compute_pass_at_k_range
 
 
 logger = logging.getLogger("main_sft")
@@ -29,11 +25,9 @@ DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 
 
 class EnvSetter(Actor):
-    """Set process-wide environment variables before importing GPU runtimes."""
-
     @endpoint
-    def set_env(self, env_vars: dict[str, str]) -> None:
-        os.environ.update(env_vars)
+    def set_env(self, env_vars: Mapping[str, str]) -> None:
+        os.environ.update({str(key): str(value) for key, value in env_vars.items()})
 
 
 def load_config(config_path: Path) -> dict[str, Any]:
@@ -44,185 +38,450 @@ def load_config(config_path: Path) -> dict[str, Any]:
     return config
 
 
-def get_worker_config(config: dict[str, Any]) -> tuple[int, dict[str, str], float]:
-    monarch_config = config.get("monarch", {})
-    if not isinstance(monarch_config, dict):
-        raise ValueError("monarch must be a mapping.")
-    train_config = monarch_config.get("train", {})
-    if not isinstance(train_config, dict):
-        raise ValueError("monarch.train must be a mapping.")
+def _mapping(value: Any, name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a mapping.")
+    return dict(value)
 
-    gpu_ids = train_config.get("gpu_ids", [0])
-    if not isinstance(gpu_ids, list) or not gpu_ids:
-        raise ValueError("monarch.train.gpu_ids must be a non-empty list.")
-    if any(not isinstance(gpu_id, int) or gpu_id < 0 for gpu_id in gpu_ids):
-        raise ValueError(
-            "monarch.train.gpu_ids entries must be non-negative integers."
-        )
-    if len(set(gpu_ids)) != len(gpu_ids):
-        raise ValueError("monarch.train.gpu_ids must not contain duplicates.")
-    num_gpus = len(gpu_ids)
 
-    configured_env = monarch_config.get("env", {})
-    if not isinstance(configured_env, dict):
-        raise ValueError("monarch.env must be a mapping of environment variables.")
-    worker_env = {str(key): str(value) for key, value in configured_env.items()}
-    worker_env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+def _positive_int(value: Any, name: str) -> int:
+    result = int(value)
+    if result <= 0:
+        raise ValueError(f"{name} must be positive.")
+    return result
 
-    shutdown_timeout = monarch_config.get(
-        "shutdown_timeout_seconds", DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+
+def validate_sft_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    monarch = _mapping(config.get("monarch"), "monarch")
+    train_actor = _mapping(config.get("train_actor"), "train_actor")
+    rollout_actor = _mapping(config.get("rollout_actor"), "rollout_actor")
+    train_config = _mapping(train_actor.get("train"), "train_actor.train")
+    dataloader = _mapping(config.get("dataloader"), "dataloader")
+    train_data = _mapping(dataloader.get("train"), "dataloader.train")
+    eval_data = _mapping(dataloader.get("eval"), "dataloader.eval")
+    engine = _mapping(rollout_actor.get("engine"), "rollout_actor.engine")
+    eval_config = _mapping(rollout_actor.get("eval"), "rollout_actor.eval")
+    eval_sampling = _mapping(
+        eval_config.get("sampling"), "rollout_actor.eval.sampling"
     )
-    if not isinstance(shutdown_timeout, (int, float)) or shutdown_timeout <= 0:
-        raise ValueError("monarch.shutdown_timeout_seconds must be positive.")
-    return num_gpus, worker_env, float(shutdown_timeout)
 
+    train_num_gpus = _positive_int(train_actor.get("num_gpus", 0), "train_actor.num_gpus")
+    rollout_num_gpus = _positive_int(
+        rollout_actor.get("num_gpus", 0), "rollout_actor.num_gpus"
+    )
+    train_gpus = list(range(train_num_gpus))
+    rollout_gpus = list(range(train_num_gpus, train_num_gpus + rollout_num_gpus))
 
-async def wait_for_call_or_shutdown(call: Any, shutdown_event: asyncio.Event) -> bool:
-    """Wait for a Monarch call, returning False when controller shutdown wins."""
-    call_task = asyncio.ensure_future(call)
-    shutdown_task = asyncio.create_task(shutdown_event.wait())
-    try:
-        done, _ = await asyncio.wait(
-            {call_task, shutdown_task},
-            return_when=asyncio.FIRST_COMPLETED,
+    for name, data_config in (
+        ("dataloader.train", train_data),
+        ("dataloader.eval", eval_data),
+    ):
+        path = data_config.get("path")
+        if not path:
+            raise ValueError(f"{name}.path is required.")
+        if not Path(str(path)).expanduser().is_file():
+            raise FileNotFoundError(f"{name}.path does not exist: {path}")
+
+    max_steps = _positive_int(train_config.get("max_steps", 1), "train_actor.train.max_steps")
+    eval_steps = _positive_int(
+        eval_config.get("eval_steps", 1), "rollout_actor.eval.eval_steps"
+    )
+    eval_epochs = _positive_int(
+        eval_config.get("eval_epochs", 1), "rollout_actor.eval.eval_epochs"
+    )
+    eval_batch_size = _positive_int(
+        eval_config.get("batch_size", 1), "rollout_actor.eval.batch_size"
+    )
+    eval_max_tokens = _positive_int(
+        eval_sampling.get("max_tokens", 1), "rollout_actor.eval.sampling.max_tokens"
+    )
+    if int(eval_sampling.get("n", 1)) <= 0:
+        raise ValueError("eval sampling.n must be positive.")
+    max_model_len = int(engine.get("max_model_len", 0))
+    if max_model_len <= 0:
+        raise ValueError("rollout_actor.engine.max_model_len must be positive.")
+    if eval_max_tokens > max_model_len:
+        raise ValueError("eval sampling.max_tokens must not exceed engine.max_model_len.")
+
+    transfer_config = _mapping(
+        engine.get("weight_transfer_config"),
+        "rollout_actor.engine.weight_transfer_config",
+    )
+    if transfer_config.get("backend") != "nccl":
+        raise ValueError(
+            "rollout_actor.engine.weight_transfer_config.backend must be nccl."
         )
-        if call_task in done:
-            await call_task
-            return True
 
-        call_task.cancel()
-        await asyncio.gather(call_task, return_exceptions=True)
-        return False
-    finally:
-        shutdown_task.cancel()
-        await asyncio.gather(shutdown_task, return_exceptions=True)
+    configured_env = _mapping(monarch.get("env"), "monarch.env")
+    shutdown_timeout = float(
+        monarch.get("shutdown_timeout_seconds", DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
+    )
+    if shutdown_timeout <= 0:
+        raise ValueError("monarch.shutdown_timeout_seconds must be positive.")
 
-
-async def shutdown_monarch(proc_mesh: ProcMesh | None, timeout: float) -> None:
-    """Stop the worker mesh and global Monarch context with bounded waits."""
-    async def shutdown_sequence() -> None:
-        if proc_mesh is not None:
-            try:
-                await proc_mesh.stop("SFT controller shutdown")
-            except Exception:
-                logger.exception("Failed while stopping the training mesh.")
-
-        try:
-            await shutdown_context()
-        except Exception:
-            logger.exception("Failed while shutting down Monarch context.")
-
-    try:
-        await asyncio.wait_for(shutdown_sequence(), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning("Monarch shutdown exceeded the %.1fs timeout.", timeout)
-
-
-async def run_sft(config_path: Path) -> int | None:
-    config_path = config_path.expanduser().resolve()
-    config = load_config(config_path)
-    num_gpus, worker_env, shutdown_timeout = get_worker_config(config)
-
-    loop = asyncio.get_running_loop()
-    shutdown_event = asyncio.Event()
-    received_signal: int | None = None
-    mesh_failure: MeshFailure | None = None
-    proc_mesh: ProcMesh | None = None
-
-    previous_fault_hook = monarch_actor.unhandled_fault_hook
-    previous_signal_handlers = {
-        signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+    return {
+        "train_gpus": train_gpus,
+        "rollout_gpus": rollout_gpus,
+        "worker_env": {str(key): str(value) for key, value in configured_env.items()},
+        "shutdown_timeout": shutdown_timeout,
+        "max_steps": max_steps,
+        "eval_steps": eval_steps,
+        "eval_epochs": eval_epochs,
+        "eval_batch_size": eval_batch_size,
+        "eval_sampling": eval_sampling,
     }
 
-    def request_shutdown(signum: int) -> None:
-        nonlocal received_signal
-        if shutdown_event.is_set():
-            return
-        received_signal = signum
-        logger.info("Received %s; stopping training.", signal.Signals(signum).name)
-        shutdown_event.set()
 
-    def signal_handler(signum: int, frame: Any) -> None:
-        if shutdown_event.is_set() and signum == signal.SIGINT:
-            signal.default_int_handler(signum, frame)
-            return
-        loop.call_soon_threadsafe(request_shutdown, signum)
+def summarize_sft_results(train_results: Mapping[Any, Any]) -> dict[str, float | bool]:
+    results = list(train_results.values())
+    if not results:
+        raise RuntimeError("No train actor results returned for SFT step.")
 
-    def record_mesh_failure(failure: MeshFailure) -> None:
-        nonlocal mesh_failure
-        if received_signal is not None:
-            logger.debug(
-                "Ignoring supervision event raised during %s shutdown:\n%s",
-                signal.Signals(received_signal).name,
-                failure.report(),
+    active_results = [result for result in results if not result.finished]
+    if not active_results:
+        return {
+            "finished": True,
+            "ranks": float(len(results)),
+            "step": float(max(int(result.step) for result in results)),
+            "epoch": float(max(int(result.epoch) for result in results)),
+            "loss_mean": float("nan"),
+            "lr_mean": float("nan"),
+            "grad_norm_mean": float("nan"),
+            "grad_norm_max": float("nan"),
+            "elapsed_seconds_max": 0.0,
+        }
+
+    count = float(len(active_results))
+
+    def mean(field: str) -> float:
+        return sum(float(getattr(result, field)) for result in active_results) / count
+
+    return {
+        "finished": all(bool(result.finished) for result in results),
+        "ranks": float(len(results)),
+        "step": float(max(int(result.step) for result in active_results)),
+        "epoch": float(max(int(result.epoch) for result in active_results)),
+        "loss_mean": mean("loss"),
+        "lr_mean": mean("learning_rate"),
+        "grad_norm_mean": mean("grad_norm"),
+        "grad_norm_max": max(float(result.grad_norm) for result in active_results),
+        "elapsed_seconds_max": max(
+            float(result.elapsed_seconds) for result in active_results
+        ),
+    }
+
+
+def reserve_local_port() -> tuple[str, int]:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return "127.0.0.1", int(sock.getsockname()[1])
+
+
+async def _set_mesh_environment(
+    proc_mesh: ProcMesh, name: str, env_vars: Mapping[str, str]
+) -> None:
+    setter = proc_mesh.spawn(f"{name}_env", EnvSetter)
+    await setter.set_env.call(env_vars)
+
+
+async def run_eval(
+    *,
+    eval_dataset: Any,
+    reward_actor: Any,
+    rollout_actor: Any,
+    batch_size: int,
+    epochs: int,
+    sampling_params: Mapping[str, Any],
+    step: int | None,
+) -> None:
+    correctness_groups: list[list[float]] = []
+    for _ in range(epochs):
+        eval_batches = await eval_dataset.all_batches.call_one(batch_size)
+        for dataset_samples in eval_batches:
+            rollout_outputs = await rollout_actor.chat.call_one(
+                [sample.messages for sample in dataset_samples],
+                sampling_params=dict(sampling_params),
             )
-            return
-        if mesh_failure is None:
-            mesh_failure = failure
-            logger.error("Monarch mesh failure:\n%s", failure.report())
-        shutdown_event.set()
+            if len(dataset_samples) != len(rollout_outputs):
+                raise RuntimeError("Eval dataset and rollout batch sizes do not match.")
 
-    def fault_hook(failure: MeshFailure) -> None:
-        loop.call_soon_threadsafe(record_mesh_failure, failure)
+            for dataset_sample, rollout_output in zip(dataset_samples, rollout_outputs):
+                reward_results = await reward_actor.evaluate_batch.call_one(
+                    [sample.text for sample in rollout_output.samples],
+                    [dataset_sample.target] * len(rollout_output.samples),
+                )
+                correctness_groups.append(
+                    [
+                        float(result.breakdown["correctness"])
+                        for result in reward_results
+                    ]
+                )
 
-    monarch_actor.unhandled_fault_hook = fault_hook
-    for signum in previous_signal_handlers:
-        signal.signal(signum, signal_handler)
-
-    proceed = True
-    try:
+    logger.info(
+        "Eval %s processed %d sample group(s) across %d epoch(s).",
+        "baseline" if step is None else f"step {step}",
+        len(correctness_groups),
+        epochs,
+    )
+    max_k = int(sampling_params.get("n", 1))
+    metrics = compute_pass_at_k_range(correctness_groups, max_k)
+    step_label = "baseline" if step is None else f"step {step}"
+    for metric in metrics:
         logger.info(
-            "Starting VeOmni SFT with %d Monarch processes on CUDA devices %s.",
-            num_gpus,
-            worker_env["CUDA_VISIBLE_DEVICES"],
+            "Eval %s: pass@%d=%.4f, g-pass@%d=%.4f, all-pass@%d=%.4f.",
+            step_label,
+            metric.k,
+            metric.pass_at_k,
+            metric.k,
+            metric.g_pass_at_k,
+            metric.k,
+            metric.all_pass_at_k,
         )
-        proc_mesh = this_host().spawn_procs(
-            per_host={"procs": num_gpus},
+
+
+async def sync_policy_weights(
+    *,
+    rollout_actor: Any,
+    train_actors: Any,
+    weight_metadata: Mapping[str, Any],
+    version: int,
+    allow_same_version: bool = False,
+) -> Any:
+    update_result, _ = await asyncio.gather(
+        rollout_actor.receive_weights.call_one(
+            weight_metadata,
+            version=version,
+            allow_same_version=allow_same_version,
+        ),
+        train_actors.broadcast_weights.call(),
+    )
+    return update_result
+
+
+async def close_resources(
+    *,
+    rollout_actor: Any | None,
+    train_actors: Any | None,
+    proc_meshes: Sequence[ProcMesh],
+    timeout: float,
+) -> None:
+    phase_timeout = max(timeout / 3.0, 1.0)
+
+    async def run_phase(name: str, awaitables: Sequence[Awaitable[Any]]) -> None:
+        if not awaitables:
+            return
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*awaitables, return_exceptions=True),
+                timeout=phase_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("%s exceeded %.1fs.", name, phase_timeout)
+            return
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning("%s failed: %r", name, result)
+
+    close_calls: list[Awaitable[Any]] = []
+    if rollout_actor is not None:
+        close_calls.append(rollout_actor.close.call_one())
+    if train_actors is not None:
+        close_calls.append(train_actors.close.call())
+    await run_phase("Actor close", close_calls)
+
+    stop_calls = [
+        proc_mesh.stop("SFT controller shutdown")
+        for proc_mesh in reversed(proc_meshes)
+    ]
+    await run_phase("Process mesh stop", stop_calls)
+
+    try:
+        await asyncio.wait_for(shutdown_context(), timeout=phase_timeout)
+    except asyncio.TimeoutError:
+        logger.warning("Monarch context shutdown exceeded %.1fs.", phase_timeout)
+    except Exception:
+        logger.exception("Failed to shut down Monarch context.")
+
+
+async def run_sft(config_path: Path) -> None:
+    config_path = config_path.expanduser().resolve()
+    config = load_config(config_path)
+    settings = validate_sft_config(config)
+    proc_meshes: list[ProcMesh] = []
+    train_actors = None
+    rollout_actor = None
+
+    try:
+        host = this_host()
+        support_actors = {}
+        actor_specs = (
+            ("train_dataset", DatasetActor, ("train",)),
+            ("eval_dataset", DatasetActor, ("eval",)),
+            ("reward", RewardActor, ()),
+        )
+        for name, actor_type, actor_args in actor_specs:
+            proc_mesh = host.spawn_procs(
+                per_host={"procs": 1}, name=f"sft_{name}_procs"
+            )
+            proc_meshes.append(proc_mesh)
+            support_actors[name] = proc_mesh.spawn(
+                f"sft_{name}", actor_type, str(config_path), *actor_args
+            )
+
+        train_dataset = support_actors["train_dataset"]
+        eval_dataset = support_actors["eval_dataset"]
+        reward_actor = support_actors["reward"]
+        await asyncio.gather(
+            train_dataset.setup.call_one(),
+            eval_dataset.setup.call_one(),
+            reward_actor.setup.call_one(),
+        )
+
+        train_mesh = host.spawn_procs(
+            per_host={"procs": len(settings["train_gpus"])},
             name="sft_train_procs",
         )
+        proc_meshes.append(train_mesh)
+        train_env = dict(settings["worker_env"])
+        train_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(gpu_id) for gpu_id in settings["train_gpus"]
+        )
+        await _set_mesh_environment(train_mesh, "sft_train", train_env)
+        await setup_torch_elastic_env_async(train_mesh)
+        train_actors = train_mesh.spawn("sft_train_actor", TrainActor, str(config_path))
+        logger.info(
+            "Initializing %d VeOmni SFT training ranks.",
+            len(settings["train_gpus"]),
+        )
+        await train_actors.setup.call()
 
-        env_setter = proc_mesh.spawn("sft_env_setter", EnvSetter)
-        if not await wait_for_call_or_shutdown(
-            env_setter.set_env.call(worker_env), shutdown_event
-        ):
-            proceed = False
+        rollout_mesh = host.spawn_procs(
+            per_host={"procs": 1}, name="sft_rollout_procs"
+        )
+        proc_meshes.append(rollout_mesh)
+        rollout_env = dict(settings["worker_env"])
+        rollout_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(gpu_id) for gpu_id in settings["rollout_gpus"]
+        )
+        await _set_mesh_environment(rollout_mesh, "sft_rollout", rollout_env)
+        rollout_actor = rollout_mesh.spawn(
+            "sft_rollout_actor", RolloutActor, str(config_path)
+        )
+        rollout_status = await rollout_actor.setup.call_one()
+        policy_version = rollout_status.policy_version
 
-        if proceed:
-            elastic_setup = asyncio.create_task(setup_torch_elastic_env_async(proc_mesh))
-            if not await wait_for_call_or_shutdown(elastic_setup, shutdown_event):
-                proceed = False
+        metadata_results = await train_actors.get_weight_transfer_metadata.call()
+        weight_metadata = next(iter(metadata_results.values()))
+        transfer_address, transfer_port = reserve_local_port()
+        transfer_world_size = 1 + len(settings["rollout_gpus"])
+        await asyncio.gather(
+            train_actors.init_weight_transfer.call(
+                transfer_address, transfer_port, transfer_world_size
+            ),
+            rollout_actor.init_weight_transfer.call_one(
+                transfer_address, transfer_port, transfer_world_size
+            ),
+        )
+        logger.info(
+            "NCCL policy transfer ready at %s:%d with %d vLLM worker(s).",
+            transfer_address,
+            transfer_port,
+            transfer_world_size - 1,
+        )
 
-        if proceed:
-            trainers = proc_mesh.spawn("train_actor", TrainActor, str(config_path))
+        update_result = await sync_policy_weights(
+            rollout_actor=rollout_actor,
+            train_actors=train_actors,
+            weight_metadata=weight_metadata,
+            version=policy_version,
+            allow_same_version=True,
+        )
+        policy_version = update_result.policy_version
+        logger.info(
+            "Initial policy sync complete: policy=v%d, NCCL sync=%.2fs.",
+            policy_version,
+            update_result.elapsed_seconds,
+        )
+        await run_eval(
+            eval_dataset=eval_dataset,
+            reward_actor=reward_actor,
+            rollout_actor=rollout_actor,
+            batch_size=settings["eval_batch_size"],
+            epochs=settings["eval_epochs"],
+            sampling_params=settings["eval_sampling"],
+            step=None,
+        )
 
-            logger.info("Initializing VeOmni trainers on all ranks.")
-            if not await wait_for_call_or_shutdown(trainers.setup.call(), shutdown_event):
-                proceed = False
+        for _ in range(settings["max_steps"]):
+            train_results = await train_actors.train_sft_step.call()
+            train_summary = summarize_sft_results(train_results)
+            if train_summary["finished"]:
+                logger.info("SFT dataloader/epoch schedule finished.")
+                break
 
-        if proceed:
-            logger.info("Running SFT on all ranks.")
-            if await wait_for_call_or_shutdown(trainers.train.call(), shutdown_event):
-                logger.info("SFT completed successfully.")
+            step = int(train_summary["step"])
+            logger.info(
+                "SFT step %d/%d complete across %.0f rank(s): "
+                "epoch=%.0f, loss_mean=%.6f, lr_mean=%.3e, "
+                "grad_norm_mean=%.4f, grad_norm_max=%.4f, train_max=%.2fs, "
+                "policy=v%d.",
+                step,
+                settings["max_steps"],
+                train_summary["ranks"],
+                train_summary["epoch"],
+                train_summary["loss_mean"],
+                train_summary["lr_mean"],
+                train_summary["grad_norm_mean"],
+                train_summary["grad_norm_max"],
+                train_summary["elapsed_seconds_max"],
+                policy_version,
+            )
+            if step % settings["eval_steps"] == 0:
+                update_result = await sync_policy_weights(
+                    rollout_actor=rollout_actor,
+                    train_actors=train_actors,
+                    weight_metadata=weight_metadata,
+                    version=policy_version + 1,
+                )
+                policy_version = update_result.policy_version
+                logger.info(
+                    "SFT eval sync complete at step %d: policy=v%d, NCCL sync=%.2fs.",
+                    step,
+                    policy_version,
+                    update_result.elapsed_seconds,
+                )
+                await run_eval(
+                    eval_dataset=eval_dataset,
+                    reward_actor=reward_actor,
+                    rollout_actor=rollout_actor,
+                    batch_size=settings["eval_batch_size"],
+                    epochs=settings["eval_epochs"],
+                    sampling_params=settings["eval_sampling"],
+                    step=step,
+                )
+
+        logger.info("SFT training completed successfully.")
     finally:
-        try:
-            if proc_mesh is not None or shutdown_event.is_set():
-                logger.info("Shutting down Monarch resources.")
-            cleanup_task = asyncio.create_task(shutdown_monarch(proc_mesh, shutdown_timeout))
-            await asyncio.shield(cleanup_task)
-        finally:
-            for signum, previous_handler in previous_signal_handlers.items():
-                signal.signal(signum, previous_handler)
-            monarch_actor.unhandled_fault_hook = previous_fault_hook
-
-    if mesh_failure is not None:
-        raise RuntimeError(f"Monarch mesh failure:\n{mesh_failure.report()}")
-    return received_signal
+        await asyncio.shield(
+            close_resources(
+                rollout_actor=rollout_actor,
+                train_actors=train_actors,
+                proc_meshes=proc_meshes,
+                timeout=settings["shutdown_timeout"],
+            )
+        )
 
 
 def parse_cli_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run VeOmni text SFT with Monarch.")
+    parser = argparse.ArgumentParser(
+        description="Run Monarch + VeOmni SFT with vLLM eval."
+    )
     parser.add_argument("config", nargs="?", type=Path, help="Path to the YAML config.")
-    parser.add_argument("--config", dest="config_option", type=Path, help="Path to the YAML config.")
+    parser.add_argument(
+        "--config", dest="config_option", type=Path, help="Path to the YAML config."
+    )
     args = parser.parse_args()
     if args.config is not None and args.config_option is not None:
         parser.error("Specify the config either positionally or with --config, not both.")
@@ -237,12 +496,10 @@ def main() -> None:
     )
     args = parse_cli_args()
     try:
-        received_signal = asyncio.run(run_sft(args.config_path))
+        asyncio.run(run_sft(args.config_path))
     except KeyboardInterrupt:
         logger.warning("Forced shutdown requested.")
         raise SystemExit(130) from None
-    if received_signal is not None:
-        raise SystemExit(128 + received_signal)
 
 
 if __name__ == "__main__":

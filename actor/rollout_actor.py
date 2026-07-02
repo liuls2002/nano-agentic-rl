@@ -80,33 +80,25 @@ def load_rollout_config(config_path: str) -> dict[str, Any]:
 
 def _apply_environment(config: Mapping[str, Any]) -> None:
     monarch_config = _require_mapping(config.get("monarch"), "monarch")
-    rollout_config = _require_mapping(
-        monarch_config.get("rollout"), "monarch.rollout"
-    )
+    rollout_actor = _require_mapping(config.get("rollout_actor"), "rollout_actor")
 
     environment = _require_mapping(monarch_config.get("env"), "monarch.env")
-    environment.update(
-        _require_mapping(rollout_config.get("env"), "monarch.rollout.env")
-    )
+    environment.update(_require_mapping(rollout_actor.get("env"), "rollout_actor.env"))
     for name, value in environment.items():
         os.environ[str(name)] = str(value)
 
-    gpu_ids = rollout_config.get("gpu_ids")
-    if gpu_ids is not None:
-        if not isinstance(gpu_ids, Sequence) or isinstance(gpu_ids, (str, bytes)):
-            raise TypeError(
-                "monarch.rollout.gpu_ids must be a sequence of GPU identifiers."
-            )
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
-
 
 def _build_engine_kwargs(config: Mapping[str, Any]) -> dict[str, Any]:
-    vllm_config = _require_mapping(config.get("vllm"), "vllm")
-    engine_config = _require_mapping(vllm_config.get("engine"), "vllm.engine")
+    rollout_actor = _require_mapping(config.get("rollout_actor"), "rollout_actor")
+    engine_config = _require_mapping(
+        rollout_actor.get("engine"), "rollout_actor.engine"
+    )
 
     model_path = engine_config.get("model")
     if not model_path:
-        raise ValueError("vllm.engine.model is required to initialize RolloutActor.")
+        raise ValueError(
+            "rollout_actor.engine.model is required to initialize RolloutActor."
+        )
 
     engine_config.setdefault("tokenizer", str(model_path))
     engine_config.setdefault("data_parallel_size", 1)
@@ -119,41 +111,46 @@ def _build_engine_kwargs(config: Mapping[str, Any]) -> dict[str, Any]:
     engine_config.setdefault("seed", 0)
     engine_config.setdefault("disable_log_stats", True)
 
-    monarch_config = _require_mapping(config.get("monarch"), "monarch")
-    rollout_resources = _require_mapping(
-        monarch_config.get("rollout"), "monarch.rollout"
-    )
-    gpu_ids = rollout_resources.get("gpu_ids")
-    if not isinstance(gpu_ids, Sequence) or isinstance(gpu_ids, (str, bytes)):
-        raise TypeError(
-            "monarch.rollout.gpu_ids must be a sequence of GPU identifiers."
-        )
+    num_gpus = int(rollout_actor.get("num_gpus", 0))
+    if num_gpus <= 0:
+        raise ValueError("rollout_actor.num_gpus must be positive.")
     required_gpus = (
         int(engine_config["data_parallel_size"])
         * int(engine_config["tensor_parallel_size"])
         * int(engine_config["pipeline_parallel_size"])
     )
-    if len(gpu_ids) != required_gpus:
+    if num_gpus != required_gpus:
         raise ValueError(
-            "monarch.rollout.gpu_ids must contain exactly "
-            "vllm.engine.data_parallel_size * tensor_parallel_size * "
+            "rollout_actor.num_gpus must equal "
+            "engine.data_parallel_size * tensor_parallel_size * "
             "pipeline_parallel_size entries "
-            f"({required_gpus} required, got {len(gpu_ids)})."
+            f"({required_gpus} required, got {num_gpus})."
         )
     return engine_config
 
 
 def _build_default_sampling_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    rollout_config = _require_mapping(config.get("vllm"), "vllm")
-    sampling_config = _require_mapping(
-        rollout_config.get("sampling"), "vllm.sampling"
+    rollout_actor = _require_mapping(config.get("rollout_actor"), "rollout_actor")
+    rollout_config = _require_mapping(
+        rollout_actor.get("rollout"), "rollout_actor.rollout"
     )
+    if rollout_config:
+        sampling_config = _require_mapping(
+            rollout_config.get("sampling"), "rollout_actor.rollout.sampling"
+        )
+    else:
+        eval_config = _require_mapping(
+            rollout_actor.get("eval"), "rollout_actor.eval"
+        )
+        sampling_config = _require_mapping(
+            eval_config.get("sampling"), "rollout_actor.eval.sampling"
+        )
 
     sampling_config.setdefault("n", 1)
     sampling_config.setdefault("max_tokens", 512)
     sampling_config.setdefault("temperature", 1.0)
     sampling_config.setdefault("top_p", 1.0)
-    sampling_config.setdefault("logprobs", 1)
+    sampling_config.setdefault("logprobs", 0 if not rollout_config else 1)
     return sampling_config
 
 
@@ -291,8 +288,24 @@ class RolloutActor(Actor):
         params.output_kind = self._request_output_kind.FINAL_ONLY
         return params
 
-    def _next_policy_version(self, version: int | None) -> int:
+    def _make_single_sample_params(self, sampling_params: Any) -> tuple[Any, int]:
+        requested_n = int(getattr(sampling_params, "n", 1))
+        if requested_n <= 0:
+            raise ValueError("sampling n must be positive.")
+        if requested_n == 1:
+            return sampling_params, 1
+
+        single_params = sampling_params.clone()
+        single_params.n = 1
+        single_params.output_kind = self._request_output_kind.FINAL_ONLY
+        return single_params, requested_n
+
+    def _next_policy_version(
+        self, version: int | None, *, allow_same_version: bool = False
+    ) -> int:
         next_version = self.policy_version + 1 if version is None else int(version)
+        if allow_same_version and next_version == self.policy_version:
+            return next_version
         if next_version <= self.policy_version:
             raise ValueError(
                 f"Policy version must increase beyond {self.policy_version}, "
@@ -312,6 +325,27 @@ class RolloutActor(Actor):
             raise RuntimeError("vLLM returned no output for a rollout request.")
         return request_output
 
+    async def _generate_expanded(
+        self, prompt: Any, sampling_params: Any, policy_version: int
+    ) -> RolloutOutput:
+        single_params, requested_n = self._make_single_sample_params(sampling_params)
+        request_outputs = []
+        for _ in range(requested_n):
+            request_outputs.append(await self._generate_one(prompt, single_params))
+
+        converted_outputs = [
+            _convert_request_output(output, policy_version)
+            for output in request_outputs
+        ]
+        if not converted_outputs:
+            raise RuntimeError("vLLM returned no outputs for a rollout request.")
+
+        merged = converted_outputs[0]
+        for output in converted_outputs[1:]:
+            merged.samples.extend(output.samples)
+            merged.num_cached_tokens += output.num_cached_tokens
+        return merged
+
     @endpoint
     async def setup(self) -> RolloutActorStatus:
         async with self._lock:
@@ -322,14 +356,32 @@ class RolloutActor(Actor):
             _apply_environment(config)
             engine_kwargs = _build_engine_kwargs(config)
             self._default_sampling_config = _build_default_sampling_config(config)
-            monarch_config = _require_mapping(config.get("monarch"), "monarch")
-            rl_config = _require_mapping(monarch_config.get("rl"), "monarch.rl")
-            self._max_prompt_tokens = int(rl_config.get("max_prompt_tokens", 512))
+            rl_config = _require_mapping(config.get("rl"), "rl")
+            rollout_actor = _require_mapping(
+                config.get("rollout_actor"), "rollout_actor"
+            )
+            rollout_config = _require_mapping(
+                rollout_actor.get("rollout"), "rollout_actor.rollout"
+            )
+            eval_config = _require_mapping(
+                rollout_actor.get("eval"), "rollout_actor.eval"
+            )
+            eval_sampling_config = _require_mapping(
+                eval_config.get("sampling"), "rollout_actor.eval.sampling"
+            )
+            max_model_len = int(engine_kwargs.get("max_model_len", 0))
+            eval_max_tokens = int(eval_sampling_config.get("max_tokens", 256))
+            self._max_prompt_tokens = int(
+                rollout_config.get(
+                    "max_prompt_tokens",
+                    max(max_model_len - eval_max_tokens, 1) if max_model_len else 512,
+                )
+            )
             self._max_response_tokens = int(
-                rl_config.get("max_response_tokens", 256)
+                rollout_config.get("max_response_tokens", eval_max_tokens)
             )
             weight_sync_config = _require_mapping(
-                rl_config.get("weight_sync"), "monarch.rl.weight_sync"
+                rl_config.get("weight_sync"), "rl.weight_sync"
             )
             self._weight_transfer_packed = bool(
                 weight_sync_config.get("packed", True)
@@ -362,8 +414,9 @@ class RolloutActor(Actor):
             self._request_output_kind = RequestOutputKind
             self.model_path = str(engine_kwargs["model"])
 
-            rollout_config = _require_mapping(config.get("vllm"), "vllm")
-            self.policy_version = int(rollout_config.get("initial_policy_version", 0))
+            self.policy_version = int(
+                rollout_actor.get("initial_policy_version", 0)
+            )
             logger.info(
                 "vLLM rollout engine initialized at policy version %s.",
                 self.policy_version,
@@ -400,16 +453,14 @@ class RolloutActor(Actor):
                 [{"prompt": prompt} for prompt in normalized_prompts],
                 self._make_tokenize_params(resolved_sampling_params),
             )
-            request_outputs = await asyncio.gather(
+            outputs = await asyncio.gather(
                 *(
-                    self._generate_one(prompt, resolved_sampling_params)
+                    self._generate_expanded(
+                        prompt, resolved_sampling_params, policy_version
+                    )
                     for prompt in engine_prompts
                 )
             )
-            outputs = [
-                _convert_request_output(output, policy_version)
-                for output in request_outputs
-            ]
             logger.info(
                 "Generated %s sequence(s) for %s prompt(s) with policy v%s in %.2fs.",
                 sum(len(output.samples) for output in outputs),
@@ -447,19 +498,17 @@ class RolloutActor(Actor):
                         "tools": None,
                         "tokenize": False,
                     }
-                ),
-                self._make_tokenize_params(resolved_sampling_params),
-            )
-            request_outputs = await asyncio.gather(
+                    ),
+                    self._make_tokenize_params(resolved_sampling_params),
+                )
+            return await asyncio.gather(
                 *(
-                    self._generate_one(prompt, resolved_sampling_params)
+                    self._generate_expanded(
+                        prompt, resolved_sampling_params, policy_version
+                    )
                     for prompt in engine_prompts
                 )
             )
-            return [
-                _convert_request_output(output, policy_version)
-                for output in request_outputs
-            ]
 
     @endpoint
     async def update_weights(
@@ -585,6 +634,7 @@ class RolloutActor(Actor):
         metadata: Mapping[str, Any],
         *,
         version: int | None = None,
+        allow_same_version: bool = False,
     ) -> WeightUpdateResult:
         """Receive one HF-format policy update directly from the trainer GPUs."""
         async with self._lock:
@@ -610,7 +660,10 @@ class RolloutActor(Actor):
             )
 
             llm = self._require_llm()
-            next_version = self._next_policy_version(version)
+            next_version = self._next_policy_version(
+                version,
+                allow_same_version=allow_same_version,
+            )
             started_at = time.perf_counter()
             update_started = False
             paused = False

@@ -20,7 +20,7 @@ from actor.train_actor import TrainActor
 from main_rl import load_config, reserve_local_port, validate_rl_config
 
 
-DEFAULT_CONFIG = PROJECT_ROOT / "config" / "qwen2_5_1_5b_gsm8k_sft.yaml"
+DEFAULT_CONFIG = PROJECT_ROOT / "config" / "qwen2_5_1_5b_gsm8k.yaml"
 
 
 class EnvSetter(Actor):

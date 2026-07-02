@@ -6,7 +6,6 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -22,6 +21,7 @@ from veomni.arguments import VeOmniArguments, parse_args
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.models.module_utils import save_model_weights
 from veomni.trainer.text_trainer import TextTrainer
+from veomni.trainer.base import VeOmniIter
 from veomni.utils.device import synchronize
 
 from rl.loss import grpo_loss
@@ -43,69 +43,59 @@ class GRPOTrainStepResult:
     elapsed_seconds: float
 
 
-def process_prompt_response_example(
-    example: dict[str, Any],
-    *,
-    chat_template: Any,
-    max_seq_len: int,
-    prompt_key: str,
-    response_key: str,
-    system_prompt: str | None = None,
-    **_: Any,
-) -> list[dict[str, torch.Tensor]]:
-    """Convert a prompt/response row to VeOmni's conversation SFT format."""
-    missing_keys = [key for key in (prompt_key, response_key) if key not in example]
-    if missing_keys:
-        raise KeyError(f"Dataset row is missing required keys: {missing_keys}")
-
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt, "loss_mask": 0})
-    messages.extend(
-        [
-            {"role": "user", "content": str(example[prompt_key]), "loss_mask": 0},
-            {"role": "assistant", "content": str(example[response_key]), "loss_mask": 1},
-        ]
-    )
-    tokenized = chat_template.encode_messages(messages, max_seq_len=max_seq_len)
-    return [{key: torch.tensor(value) for key, value in tokenized.items()}]
+@dataclass
+class SFTTrainStepResult:
+    step: int
+    epoch: int
+    loss: float
+    grad_norm: float
+    learning_rate: float
+    elapsed_seconds: float
+    finished: bool
 
 
-class PromptResponseTextTrainer(TextTrainer):
-    """TextTrainer variant for datasets with separate prompt and response columns."""
-
-    def __init__(self, args: VeOmniArguments, adapter_config: dict[str, Any]):
-        self._adapter_config = adapter_config
-        super().__init__(args)
-
-    def _build_data_transform(self) -> None:
-        args = self.base.args
-        if args.data.data_type != "conversation":
-            raise ValueError("The prompt_response adapter requires data.data_type='conversation'.")
-
-        self.base.data_transform = partial(
-            process_prompt_response_example,
-            chat_template=self.base.chat_template,
-            max_seq_len=args.data.max_seq_len,
-            prompt_key=self._adapter_config.get("prompt_key", "question"),
-            response_key=self._adapter_config.get("response_key", "answer"),
-            system_prompt=self._adapter_config.get("system_prompt"),
-        )
+def _mapping(value: Any, name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping.")
+    return dict(value)
 
 
-def load_veomni_args(
-    config_path: str, veomni_config: dict[str, Any] | None = None
-) -> VeOmniArguments:
+def load_veomni_args(config_path: str) -> VeOmniArguments:
     """Extract and parse VeOmni config after Monarch installs rank variables."""
-    if veomni_config is None:
-        with open(config_path, encoding="utf-8") as config_file:
-            raw_config = yaml.safe_load(config_file) or {}
-        veomni_config = raw_config.get("veomni")
-    if not isinstance(veomni_config, dict):
-        raise ValueError("veomni must be a mapping.")
+    with open(config_path, encoding="utf-8") as config_file:
+        raw_config = yaml.safe_load(config_file) or {}
 
-    parser_config = dict(veomni_config)
-    parser_config.pop("data_adapter", None)
+    train_actor = _mapping(raw_config.get("train_actor"), "train_actor")
+    dataloader = _mapping(raw_config.get("dataloader"), "dataloader")
+    train_loader = _mapping(dataloader.get("train"), "dataloader.train")
+    train_path = train_loader.get("path")
+    if not train_path:
+        raise ValueError("dataloader.train.path is required.")
+
+    data_config = {
+        "train_path": str(train_path),
+        "datasets_type": train_loader.get("datasets_type", "mapping"),
+        "data_type": train_loader.get("data_type", "conversation"),
+        "text_keys": train_loader.get("text_keys", "messages"),
+        "max_seq_len": int(train_loader.get("max_seq_len", 2048)),
+        "dataloader": {
+            "type": train_loader.get("type", "native"),
+            "num_workers": int(train_loader.get("num_workers", 0)),
+            "drop_last": bool(train_loader.get("drop_last", True)),
+            "pin_memory": bool(train_loader.get("pin_memory", True)),
+        },
+    }
+    for key in ("worker_num_threads", "prefetch_factor", "use_background_prefetcher"):
+        if key in train_loader:
+            data_config["dataloader"][key] = train_loader[key]
+
+    parser_config = {
+        "model": _mapping(train_actor.get("model"), "train_actor.model"),
+        "data": data_config,
+        "train": _mapping(train_actor.get("train"), "train_actor.train"),
+    }
     original_argv = sys.argv
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".yaml", encoding="utf-8"
@@ -134,6 +124,10 @@ class TrainActor(Actor):
         self._weight_transfer_packed = True
         self._weight_transfer_buffer_size = 256 * 1024 * 1024
         self._weight_transfer_num_buffers = 2
+        self._sft_started = False
+        self._sft_finished = False
+        self._sft_epoch = 0
+        self._sft_step_in_epoch = 0
 
     def _require_trainer(self) -> TextTrainer:
         if self.trainer is None:
@@ -148,21 +142,12 @@ class TrainActor(Actor):
         with open(self.config_path, encoding="utf-8") as config_file:
             raw_config = yaml.safe_load(config_file) or {}
 
-        veomni_config = raw_config.get("veomni")
-        if not isinstance(veomni_config, dict):
-            raise ValueError("veomni must be a mapping.")
-
-        monarch_config = raw_config.get("monarch", {})
-        if not isinstance(monarch_config, dict):
-            raise ValueError("monarch must be a mapping.")
-        rl_config = monarch_config.get("rl", {})
-        if not isinstance(rl_config, dict):
-            raise ValueError("monarch.rl must be a mapping.")
+        rl_config = _mapping(raw_config.get("rl"), "rl")
         self._clip_low = float(rl_config.get("clip_low", 0.2))
         self._clip_high = float(rl_config.get("clip_high", 0.28))
         weight_sync_config = rl_config.get("weight_sync", {})
         if not isinstance(weight_sync_config, dict):
-            raise ValueError("monarch.rl.weight_sync must be a mapping.")
+            raise ValueError("rl.weight_sync must be a mapping.")
         self._weight_transfer_packed = bool(weight_sync_config.get("packed", True))
         self._weight_transfer_buffer_size = int(
             weight_sync_config.get("packed_buffer_size_bytes", 256 * 1024 * 1024)
@@ -171,32 +156,21 @@ class TrainActor(Actor):
             weight_sync_config.get("packed_num_buffers", 2)
         )
 
-        vllm_config = raw_config.get("vllm", {})
-        if not isinstance(vllm_config, dict):
-            raise ValueError("vllm must be a mapping.")
-        engine_config = vllm_config.get("engine", {})
-        if not isinstance(engine_config, dict):
-            raise ValueError("vllm.engine must be a mapping.")
+        rollout_actor = _mapping(raw_config.get("rollout_actor"), "rollout_actor")
+        engine_config = _mapping(rollout_actor.get("engine"), "rollout_actor.engine")
         transfer_dtype_name = str(engine_config.get("dtype", "bfloat16"))
         transfer_dtype_name = transfer_dtype_name.removeprefix("torch.")
         transfer_dtype = getattr(torch, transfer_dtype_name, None)
         if not isinstance(transfer_dtype, torch.dtype):
             raise ValueError(
-                f"vllm.engine.dtype must name a torch dtype, got {transfer_dtype_name!r}."
+                "rollout_actor.engine.dtype must name a torch dtype, "
+                f"got {transfer_dtype_name!r}."
             )
         self._weight_transfer_dtype = transfer_dtype
 
-        args = load_veomni_args(self.config_path, veomni_config)
-        adapter_config = veomni_config.get("data_adapter")
-        if adapter_config is None:
-            self.trainer = TextTrainer(args)
-        elif not isinstance(adapter_config, dict):
-            raise ValueError("veomni.data_adapter must be a mapping.")
-        elif adapter_config.get("type") == "prompt_response":
-            self.trainer = PromptResponseTextTrainer(args, adapter_config)
-        else:
-            adapter_type = adapter_config.get("type")
-            raise ValueError(f"Unsupported data_adapter.type: {adapter_type!r}")
+        self.trainer = TextTrainer(load_veomni_args(self.config_path))
+        self._sft_epoch = int(getattr(self.trainer.base, "start_epoch", 0))
+        self._sft_step_in_epoch = int(getattr(self.trainer.base, "start_step", 0))
 
         logger.info(
             "VeOmni trainer initialized on rank %s/%s (local rank %s).",
@@ -216,6 +190,154 @@ class TrainActor(Actor):
             # failures in the middle of training so Monarch can stop the mesh cleanly.
             if dist.is_initialized():
                 trainer.base.destroy_distributed()
+
+    def _start_sft_epoch(self) -> None:
+        trainer = self._require_trainer()
+        base = trainer.base
+        args = base.args
+        if self._sft_epoch >= args.train.num_train_epochs:
+            self._sft_finished = True
+            return
+        if hasattr(base.train_dataloader, "set_epoch"):
+            base.train_dataloader.set_epoch(self._sft_epoch)
+        base.state.epoch = self._sft_epoch
+        trainer.on_epoch_begin()
+        base.data_iterator = VeOmniIter(
+            base.train_dataloader,
+            use_background_prefetcher=args.data.dataloader.use_background_prefetcher,
+        )
+
+    def _finish_sft_epoch(self) -> None:
+        trainer = self._require_trainer()
+        base = trainer.base
+        args = base.args
+        trainer.on_epoch_end()
+        if args.data.dataloader.use_background_prefetcher:
+            data_iterator = getattr(base, "data_iterator", None)
+            if data_iterator is not None:
+                data_iterator.stop()
+        base.start_step = 0
+        self._sft_epoch += 1
+        self._sft_step_in_epoch = 0
+
+    def _finish_sft_training(self) -> None:
+        trainer = self._require_trainer()
+        if self._sft_finished:
+            return
+        trainer.on_train_end()
+        data_iterator = getattr(trainer.base, "data_iterator", None)
+        if (
+            data_iterator is not None
+            and trainer.base.args.data.dataloader.use_background_prefetcher
+        ):
+            data_iterator.stop()
+        synchronize()
+        self._sft_finished = True
+
+    @endpoint
+    def train_sft_step(self) -> SFTTrainStepResult:
+        """Run one VeOmni SFT optimizer step and keep trainer state alive."""
+        trainer = self._require_trainer()
+        base = trainer.base
+        args = base.args
+        if self._sft_finished:
+            return SFTTrainStepResult(
+                step=int(base.state.global_step),
+                epoch=int(base.state.epoch),
+                loss=float("nan"),
+                grad_norm=float("nan"),
+                learning_rate=float(base.optimizer.param_groups[0]["lr"]),
+                elapsed_seconds=0.0,
+                finished=True,
+            )
+
+        if not self._sft_started:
+            trainer.on_train_begin()
+            logger.info(
+                "Rank%s Start stepwise SFT. Start step: %s. Train steps: %s. "
+                "Start epoch: %s. Train epochs: %s.",
+                args.train.local_rank,
+                base.start_step,
+                args.train_steps,
+                base.start_epoch,
+                args.train.num_train_epochs,
+            )
+            self._sft_started = True
+            self._start_sft_epoch()
+
+        started_at = time.perf_counter()
+        while not self._sft_finished:
+            if self._sft_epoch >= args.train.num_train_epochs:
+                self._finish_sft_training()
+                break
+            if self._sft_step_in_epoch >= args.train_steps:
+                self._finish_sft_epoch()
+                if self._sft_epoch >= args.train.num_train_epochs:
+                    self._finish_sft_training()
+                    break
+                self._start_sft_epoch()
+                continue
+
+            try:
+                trainer.train_step(base.data_iterator)
+            except StopIteration:
+                logger.info(
+                    "epoch:%d Dataloader finished with drop_last %s",
+                    self._sft_epoch,
+                    args.data.dataloader.drop_last,
+                )
+                self._finish_sft_epoch()
+                if self._sft_epoch < args.train.num_train_epochs:
+                    self._start_sft_epoch()
+                continue
+
+            self._sft_step_in_epoch += 1
+            step_metrics = dict(getattr(base, "step_train_metrics", {}) or {})
+            loss = float(
+                step_metrics.get(
+                    "training/total_loss",
+                    step_metrics.get("total_loss", float("nan")),
+                )
+            )
+            grad_norm = float(
+                step_metrics.get(
+                    "training/grad_norm",
+                    step_metrics.get("grad_norm", float("nan")),
+                )
+            )
+            learning_rate = float(
+                step_metrics.get("training/lr", base.optimizer.param_groups[0]["lr"])
+            )
+            result = SFTTrainStepResult(
+                step=int(base.state.global_step),
+                epoch=int(base.state.epoch),
+                loss=loss,
+                grad_norm=grad_norm,
+                learning_rate=learning_rate,
+                elapsed_seconds=time.perf_counter() - started_at,
+                finished=False,
+            )
+            logger.info(
+                "SFT step %d on rank %d: epoch=%d, loss=%.6f, lr=%.3e, "
+                "grad_norm=%.4f.",
+                result.step,
+                dist.get_rank() if dist.is_initialized() else 0,
+                result.epoch,
+                result.loss,
+                result.learning_rate,
+                result.grad_norm,
+            )
+            return result
+
+        return SFTTrainStepResult(
+            step=int(base.state.global_step),
+            epoch=int(base.state.epoch),
+            loss=float("nan"),
+            grad_norm=float("nan"),
+            learning_rate=float(base.optimizer.param_groups[0]["lr"]),
+            elapsed_seconds=time.perf_counter() - started_at,
+            finished=True,
+        )
 
     @staticmethod
     def _validate_grpo_batch(batch: Mapping[str, Any]) -> None:
@@ -343,11 +465,16 @@ class TrainActor(Actor):
             elapsed_seconds=time.perf_counter() - started_at,
         )
         logger.info(
-            "GRPO step %d on rank %d: loss=%.6f, KL=%.6f, tokens=%.0f.",
+            "GRPO step %d on rank %d: loss=%.6f, lr=%.3e, "
+            "grad_norm=%.4f, KL=%.6f, ratio=%.4f, clip=%.4f, tokens=%.0f.",
             result.step,
             rank,
             result.loss,
+            result.learning_rate,
+            result.grad_norm,
             result.approx_kl,
+            result.ratio_mean,
+            result.clip_fraction,
             result.active_tokens,
         )
         return result
@@ -499,6 +626,11 @@ class TrainActor(Actor):
     @endpoint
     def close(self) -> None:
         """Release the VeOmni process group before Monarch stops the mesh."""
+        if self.trainer is not None and self._sft_started and not self._sft_finished:
+            try:
+                self._finish_sft_training()
+            except Exception:
+                logger.exception("Failed to finish stepwise SFT before close.")
         if self._weight_transfer_group is not None:
             self._weight_transfer_group.destroy()
             self._weight_transfer_group = None

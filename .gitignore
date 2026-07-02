@@ -3,3 +3,4 @@ __pycache__/
 deps/
 outputs
 prompt.md
+data/

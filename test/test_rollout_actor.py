@@ -14,7 +14,7 @@ from monarch.actor import shutdown_context, this_host
 from actor.rollout_actor import RolloutActor
 
 
-DEFAULT_CONFIG = PROJECT_ROOT / "config" / "qwen2_5_1_5b_gsm8k_sft.yaml"
+DEFAULT_CONFIG = PROJECT_ROOT / "config" / "qwen2_5_1_5b_gsm8k.yaml"
 DEFAULT_CHECKPOINT = Path("/ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct")
 
 

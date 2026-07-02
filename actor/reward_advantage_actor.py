@@ -35,12 +35,11 @@ class AdvantageResult:
 def _load_rl_config(config_path: str) -> dict[str, Any]:
     with open(config_path, encoding="utf-8") as config_file:
         config = yaml.safe_load(config_file) or {}
-    monarch = config.get("monarch", {})
-    if not isinstance(monarch, dict):
-        raise ValueError("monarch must be a mapping.")
-    rl_config = monarch.get("rl", {})
+    rl_config = config.get("rl", {})
+    if rl_config is None:
+        return {}
     if not isinstance(rl_config, dict):
-        raise ValueError("monarch.rl must be a mapping.")
+        raise ValueError("rl must be a mapping.")
     return dict(rl_config)
 
 
@@ -74,7 +73,7 @@ class RewardActor(Actor):
     def setup(self) -> None:
         reward_config = _load_rl_config(self.config_path).get("reward", {})
         if not isinstance(reward_config, dict):
-            raise ValueError("monarch.rl.reward must be a mapping.")
+            raise ValueError("rl.reward must be a mapping.")
         self._correctness_weight = float(
             reward_config.get("correctness_weight", 1.0)
         )
@@ -145,7 +144,7 @@ class AdvantageActor(Actor):
     def setup(self) -> None:
         advantage_config = _load_rl_config(self.config_path).get("advantage", {})
         if not isinstance(advantage_config, dict):
-            raise ValueError("monarch.rl.advantage must be a mapping.")
+            raise ValueError("rl.advantage must be a mapping.")
         self._epsilon = float(advantage_config.get("epsilon", 1e-4))
         self._minimum_std = float(
             advantage_config.get("minimum_group_std", 1e-3)

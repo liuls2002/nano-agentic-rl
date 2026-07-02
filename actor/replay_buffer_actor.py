@@ -30,28 +30,31 @@ class ReplayBufferStatus:
 def _load_settings(config_path: str) -> dict[str, Any]:
     with open(config_path, encoding="utf-8") as config_file:
         config = yaml.safe_load(config_file) or {}
-    monarch = config.get("monarch", {})
-    if not isinstance(monarch, dict):
-        raise ValueError("monarch must be a mapping.")
-    rl_config = monarch.get("rl", {})
-    train_resources = monarch.get("train", {})
-    if not isinstance(rl_config, dict) or not isinstance(train_resources, dict):
-        raise ValueError("monarch.rl and monarch.train must be mappings.")
+    rl_config = config.get("rl", {})
+    train_actor = config.get("train_actor", {})
+    rollout_actor = config.get("rollout_actor", {})
+    if not isinstance(rl_config, dict) or not isinstance(train_actor, dict):
+        raise ValueError("rl and train_actor must be mappings.")
+    if not isinstance(rollout_actor, dict):
+        raise ValueError("rollout_actor must be a mapping.")
     replay = rl_config.get("replay_buffer", {})
     if not isinstance(replay, dict):
-        raise ValueError("monarch.rl.replay_buffer must be a mapping.")
-    gpu_ids = train_resources.get("gpu_ids", [])
-    if not isinstance(gpu_ids, list) or not gpu_ids:
-        raise ValueError("monarch.train.gpu_ids must be a non-empty list.")
+        raise ValueError("rl.replay_buffer must be a mapping.")
+    rollout_config = rollout_actor.get("rollout", {})
+    if not isinstance(rollout_config, dict):
+        raise ValueError("rollout_actor.rollout must be a mapping.")
+    train_num_gpus = int(train_actor.get("num_gpus", 0))
+    if train_num_gpus <= 0:
+        raise ValueError("train_actor.num_gpus must be positive.")
     return {
         "capacity": int(replay.get("capacity", 256)),
         "batch_size_per_rank": int(replay.get("batch_size_per_rank", 1)),
         "max_policy_age": int(replay.get("max_policy_age", 0)),
         "consume_samples": bool(replay.get("consume_samples", True)),
         "seed": int(replay.get("seed", 0)),
-        "data_parallel_size": len(gpu_ids),
-        "prompt_length": int(rl_config.get("max_prompt_tokens", 448)),
-        "response_length": int(rl_config.get("max_response_tokens", 64)),
+        "data_parallel_size": train_num_gpus,
+        "prompt_length": int(rollout_config.get("max_prompt_tokens", 448)),
+        "response_length": int(rollout_config.get("max_response_tokens", 64)),
         "mask_truncated": bool(rl_config.get("mask_truncated_responses", False)),
     }
 

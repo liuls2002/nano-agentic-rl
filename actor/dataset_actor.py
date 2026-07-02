@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 from monarch.actor import Actor, endpoint
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DatasetActorStatus:
     initialized: bool
+    dataset_name: str
     dataset_size: int
     epoch: int
     cursor: int
@@ -27,119 +29,167 @@ class DatasetActorStatus:
 def _mapping(value: Any, name: str) -> dict[str, Any]:
     if value is None:
         return {}
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be a mapping.")
     return dict(value)
 
 
-class DatasetActor(Actor):
-    """Own the RL prompt dataset and provide deterministic shuffled batches."""
+def _load_rows(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == ".jsonl":
+        rows = []
+        with path.open(encoding="utf-8") as data_file:
+            for line_number, line in enumerate(data_file, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError(f"Expected JSON object at {path}:{line_number}.")
+                rows.append(row)
+        return rows
 
-    def __init__(self, config_path: str):
+    from datasets import load_dataset
+
+    suffix = path.suffix.lower().removeprefix(".")
+    dataset_type = "json" if suffix == "json" else suffix
+    if dataset_type not in {"json", "parquet", "csv", "arrow"}:
+        raise ValueError(f"Unsupported dataset extension: {path.suffix}")
+    dataset = load_dataset(dataset_type, data_files={"data": str(path)}, split="data")
+    return [dict(row) for row in dataset]
+
+
+def _rollout_messages(messages: Any, path: Path) -> list[dict[str, str]]:
+    if not isinstance(messages, list):
+        raise ValueError(f"Dataset row messages must be a list: {path}")
+    normalized = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            raise ValueError(f"Dataset row messages must contain mappings: {path}")
+        role = str(message.get("role", ""))
+        content = str(message.get("content", ""))
+        if role == "assistant":
+            continue
+        if role not in {"system", "user"}:
+            raise ValueError(f"Unsupported message role {role!r}: {path}")
+        normalized.append({"role": role, "content": content})
+    if not any(message["role"] == "user" for message in normalized):
+        raise ValueError(f"Dataset row has no user message: {path}")
+    return normalized
+
+
+def _prompt_text(messages: list[dict[str, str]]) -> str:
+    for message in reversed(messages):
+        if message["role"] == "user":
+            return message["content"]
+    raise ValueError("DatasetSample messages must contain a user message.")
+
+
+class DatasetActor(Actor):
+    """Load preprocessed RL data and provide prompt/target batches."""
+
+    def __init__(self, config_path: str, dataset_name: str = "train"):
         self.config_path = str(Path(config_path).expanduser().resolve())
-        self._dataset: Any | None = None
+        self.dataset_name = str(dataset_name)
+        self._rows: list[dict[str, Any]] = []
         self._order: list[int] = []
         self._cursor = 0
         self._epoch = 0
         self._seed = 0
-        self._rng = random.Random()
-        self._prompt_key = "question"
-        self._response_key = "answer"
-        self._system_prompt: str | None = None
+        self._shuffle = False
+        self._drop_last = False
+        self._path: Path | None = None
         self._pad_token_id: int | None = None
 
     @endpoint
     def setup(self) -> DatasetActorStatus:
-        if self._dataset is not None:
+        if self._rows:
             raise RuntimeError("DatasetActor.setup() may only be called once.")
 
         with open(self.config_path, encoding="utf-8") as config_file:
             config = yaml.safe_load(config_file) or {}
-        veomni = _mapping(config.get("veomni"), "veomni")
-        data = _mapping(veomni.get("data"), "veomni.data")
-        adapter = _mapping(veomni.get("data_adapter"), "veomni.data_adapter")
-        train = _mapping(veomni.get("train"), "veomni.train")
-        model = _mapping(veomni.get("model"), "veomni.model")
 
-        train_path = data.get("train_path")
-        if not train_path:
-            raise ValueError("veomni.data.train_path is required for DatasetActor.")
-        train_path = Path(str(train_path)).expanduser().resolve()
-        if not train_path.is_file():
-            raise FileNotFoundError(f"RL training parquet does not exist: {train_path}")
-
-        from datasets import load_dataset
-        from transformers import AutoTokenizer
-
-        self._dataset = load_dataset(
-            "parquet", data_files={"train": str(train_path)}, split="train"
+        dataloader = _mapping(config.get("dataloader"), "dataloader")
+        dataset_config = _mapping(
+            dataloader.get(self.dataset_name),
+            f"dataloader.{self.dataset_name}",
         )
-        if len(self._dataset) == 0:
-            raise ValueError(f"RL training dataset is empty: {train_path}")
+        path_value = dataset_config.get("path")
+        if not path_value:
+            raise ValueError(f"dataloader.{self.dataset_name}.path is required.")
+        path = Path(str(path_value)).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Dataset file does not exist: {path}")
 
-        tokenizer_path = model.get("tokenizer_path") or model.get("model_path")
-        if not tokenizer_path:
-            raise ValueError("veomni.model.tokenizer_path or model_path is required.")
-        tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
-        self._pad_token_id = tokenizer.pad_token_id
-        if self._pad_token_id is None:
-            self._pad_token_id = tokenizer.eos_token_id
-        if self._pad_token_id is None:
-            raise ValueError("The configured tokenizer has no pad or EOS token id.")
+        rows = _load_rows(path)
+        max_samples = int(dataset_config.get("max_samples", -1))
+        if max_samples >= 0:
+            rows = rows[:max_samples]
+        if not rows:
+            raise ValueError(f"Dataset is empty: {path}")
 
-        self._prompt_key = str(adapter.get("prompt_key", "question"))
-        self._response_key = str(adapter.get("response_key", "answer"))
-        system_prompt = adapter.get("system_prompt")
-        self._system_prompt = str(system_prompt) if system_prompt else None
-        self._seed = int(train.get("seed", 0))
-        self._rng.seed(self._seed)
+        self._rows = [dict(row) for row in rows]
+        self._seed = int(dataset_config.get("seed", 0))
+        self._shuffle = bool(dataset_config.get("shuffle", self.dataset_name == "train"))
+        self._drop_last = bool(dataset_config.get("drop_last", False))
+        self._path = path
+        self._pad_token_id = self._load_pad_token_id(config)
         self._reset_order()
-        logger.info("Loaded %d RL prompts from %s.", len(self._dataset), train_path)
+        logger.info("Loaded %d %s rows from %s.", len(self._rows), self.dataset_name, path)
         return self._status()
 
+    @staticmethod
+    def _load_pad_token_id(config: Mapping[str, Any]) -> int:
+        train_actor = _mapping(config.get("train_actor"), "train_actor")
+        model = _mapping(train_actor.get("model"), "train_actor.model")
+        tokenizer_path = model.get("tokenizer_path") or model.get("model_path")
+        if not tokenizer_path:
+            raise ValueError(
+                "train_actor.model.tokenizer_path or model_path is required."
+            )
+
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("The configured tokenizer has no pad or EOS token id.")
+        return int(pad_token_id)
+
     def _reset_order(self) -> None:
-        if self._dataset is None:
-            raise RuntimeError("DatasetActor.setup() must complete first.")
-        self._order = list(range(len(self._dataset)))
-        random.Random(self._seed + self._epoch).shuffle(self._order)
+        self._order = list(range(len(self._rows)))
+        if self._shuffle:
+            random.Random(self._seed + self._epoch).shuffle(self._order)
         self._cursor = 0
 
-    @staticmethod
-    def _target_text(value: Any) -> str:
-        target = str(value).strip()
-        if "####" in target:
-            target = target.rsplit("####", 1)[-1].strip()
-        return target
-
-    def _sample_at(self, index: int) -> DatasetSample:
-        row = self._dataset[index]
-        missing = [
-            key for key in (self._prompt_key, self._response_key) if key not in row
-        ]
-        if missing:
-            raise KeyError(f"Dataset row is missing required columns: {missing}")
-
-        prompt = str(row[self._prompt_key])
-        messages = []
-        if self._system_prompt:
-            messages.append({"role": "system", "content": self._system_prompt})
-        messages.append({"role": "user", "content": prompt})
+    def _sample_at(self, index: int, sample_id: str | None = None) -> DatasetSample:
+        if self._path is None:
+            raise RuntimeError("DatasetActor.setup() must complete first.")
+        row = self._rows[index]
+        if "messages" not in row or "label" not in row:
+            raise KeyError("Preprocessed dataset rows must contain messages and label.")
+        messages = _rollout_messages(row["messages"], self._path)
         return DatasetSample(
-            sample_id=f"epoch-{self._epoch}-row-{index}",
-            prompt=prompt,
-            target=self._target_text(row[self._response_key]),
+            sample_id=sample_id or f"{self.dataset_name}-epoch-{self._epoch}-row-{index}",
+            prompt=_prompt_text(messages),
+            target=str(row["label"]).strip(),
             messages=messages,
         )
 
     @endpoint
     def next_batch(self, batch_size: int = 1) -> list[DatasetSample]:
-        if self._dataset is None:
+        if not self._rows:
             raise RuntimeError("DatasetActor.setup() must complete first.")
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
 
+        if self._drop_last and len(self._order) - self._cursor < batch_size:
+            self._epoch += 1
+            self._reset_order()
+
         samples = []
-        for _ in range(batch_size):
+        while len(samples) < batch_size:
             if self._cursor >= len(self._order):
                 self._epoch += 1
                 self._reset_order()
@@ -149,6 +199,23 @@ class DatasetActor(Actor):
         return samples
 
     @endpoint
+    def all_batches(self, batch_size: int = 1) -> list[list[DatasetSample]]:
+        if not self._rows:
+            raise RuntimeError("DatasetActor.setup() must complete first.")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+
+        batches = []
+        for start in range(0, len(self._rows), batch_size):
+            batch = []
+            for index in range(start, min(start + batch_size, len(self._rows))):
+                batch.append(
+                    self._sample_at(index, f"{self.dataset_name}-row-{index}")
+                )
+            batches.append(batch)
+        return batches
+
+    @endpoint
     def get_pad_token_id(self) -> int:
         if self._pad_token_id is None:
             raise RuntimeError("DatasetActor.setup() must complete first.")
@@ -156,8 +223,9 @@ class DatasetActor(Actor):
 
     def _status(self) -> DatasetActorStatus:
         return DatasetActorStatus(
-            initialized=self._dataset is not None,
-            dataset_size=len(self._dataset) if self._dataset is not None else 0,
+            initialized=bool(self._rows),
+            dataset_name=self.dataset_name,
+            dataset_size=len(self._rows),
             epoch=self._epoch,
             cursor=self._cursor,
             pad_token_id=self._pad_token_id,
