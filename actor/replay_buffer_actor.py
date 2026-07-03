@@ -30,22 +30,22 @@ class ReplayBufferStatus:
 def _load_settings(config_path: str) -> dict[str, Any]:
     with open(config_path, encoding="utf-8") as config_file:
         config = yaml.safe_load(config_file) or {}
+    monarch_config = config.get("monarch", {})
     rl_config = config.get("rl", {})
     train_actor = config.get("train_actor", {})
-    rollout_actor = config.get("rollout_actor", {})
-    if not isinstance(rl_config, dict) or not isinstance(train_actor, dict):
-        raise ValueError("rl and train_actor must be mappings.")
-    if not isinstance(rollout_actor, dict):
-        raise ValueError("rollout_actor must be a mapping.")
+    if not all(isinstance(item, dict) for item in (monarch_config, rl_config, train_actor)):
+        raise ValueError("monarch, rl, and train_actor must be mappings.")
     replay = rl_config.get("replay_buffer", {})
     if not isinstance(replay, dict):
         raise ValueError("rl.replay_buffer must be a mapping.")
-    rollout_config = rollout_actor.get("rollout", {})
-    if not isinstance(rollout_config, dict):
-        raise ValueError("rollout_actor.rollout must be a mapping.")
+    sequence = monarch_config.get("sequence", {})
+    if not isinstance(sequence, dict):
+        raise ValueError("monarch.sequence must be a mapping.")
     train_num_gpus = int(train_actor.get("num_gpus", 0))
     if train_num_gpus <= 0:
         raise ValueError("train_actor.num_gpus must be positive.")
+    prompt_length = int(sequence.get("max_prompt_tokens", 1024))
+    response_length = int(sequence.get("max_response_tokens", 1024))
     return {
         "capacity": int(replay.get("capacity", 256)),
         "batch_size_per_rank": int(replay.get("batch_size_per_rank", 1)),
@@ -53,8 +53,8 @@ def _load_settings(config_path: str) -> dict[str, Any]:
         "consume_samples": bool(replay.get("consume_samples", True)),
         "seed": int(replay.get("seed", 0)),
         "data_parallel_size": train_num_gpus,
-        "prompt_length": int(rollout_config.get("max_prompt_tokens", 448)),
-        "response_length": int(rollout_config.get("max_response_tokens", 64)),
+        "prompt_length": prompt_length,
+        "response_length": response_length,
         "mask_truncated": bool(rl_config.get("mask_truncated_responses", False)),
     }
 

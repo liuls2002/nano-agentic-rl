@@ -53,6 +53,23 @@ def _positive_int(value: Any, name: str) -> int:
     return result
 
 
+def _load_sequence_config(monarch: Mapping[str, Any]) -> dict[str, int]:
+    sequence = _mapping(monarch.get("sequence"), "monarch.sequence")
+    prompt_length = _positive_int(
+        sequence.get("max_prompt_tokens", 1024),
+        "monarch.sequence.max_prompt_tokens",
+    )
+    response_length = _positive_int(
+        sequence.get("max_response_tokens", 1024),
+        "monarch.sequence.max_response_tokens",
+    )
+    return {
+        "max_prompt_tokens": prompt_length,
+        "max_response_tokens": response_length,
+        "max_seq_len": prompt_length + response_length,
+    }
+
+
 def split_worker_gpus(
     train_num_gpus: int, rollout_num_gpus: int
 ) -> tuple[list[str], list[str]]:
@@ -82,6 +99,7 @@ def split_worker_gpus(
 
 def validate_sft_config(config: Mapping[str, Any]) -> dict[str, Any]:
     monarch = _mapping(config.get("monarch"), "monarch")
+    sequence = _load_sequence_config(monarch)
     train_actor = _mapping(config.get("train_actor"), "train_actor")
     rollout_actor = _mapping(config.get("rollout_actor"), "rollout_actor")
     train_config = _mapping(train_actor.get("train"), "train_actor.train")
@@ -121,13 +139,17 @@ def validate_sft_config(config: Mapping[str, Any]) -> dict[str, Any]:
         eval_config.get("batch_size", 1), "rollout_actor.eval.batch_size"
     )
     eval_max_tokens = _positive_int(
-        eval_sampling.get("max_tokens", 1), "rollout_actor.eval.sampling.max_tokens"
+        eval_sampling.get("max_tokens", sequence["max_response_tokens"]),
+        "rollout_actor.eval.sampling.max_tokens",
     )
     if int(eval_sampling.get("n", 1)) <= 0:
         raise ValueError("eval sampling.n must be positive.")
-    max_model_len = int(engine.get("max_model_len", 0))
-    if max_model_len <= 0:
-        raise ValueError("rollout_actor.engine.max_model_len must be positive.")
+    max_model_len = int(engine.get("max_model_len", sequence["max_seq_len"]))
+    if max_model_len < sequence["max_seq_len"]:
+        raise ValueError(
+            "rollout_actor.engine.max_model_len must be at least "
+            "monarch.sequence.max_prompt_tokens + max_response_tokens."
+        )
     if eval_max_tokens > max_model_len:
         raise ValueError("eval sampling.max_tokens must not exceed engine.max_model_len.")
 
@@ -151,6 +173,7 @@ def validate_sft_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "train_gpus": train_gpus,
         "rollout_gpus": rollout_gpus,
         "worker_env": {str(key): str(value) for key, value in configured_env.items()},
+        "sequence": sequence,
         "shutdown_timeout": shutdown_timeout,
         "max_steps": max_steps,
         "eval_steps": eval_steps,

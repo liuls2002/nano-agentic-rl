@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import socket
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Mapping, Sequence
@@ -27,6 +28,7 @@ from actor.rollout_actor import RolloutActor, RolloutOutput
 from actor.train_actor import TrainActor
 from rl.types import DatasetSample, RLEpisode
 from tools.eval_metrics import compute_pass_at_k_range
+from tools.runtime_metrics import GpuMonitor, prefix_metrics
 
 
 logger = logging.getLogger("main_rl")
@@ -61,6 +63,23 @@ def _positive_int(value: Any, name: str) -> int:
     if result <= 0:
         raise ValueError(f"{name} must be positive.")
     return result
+
+
+def _load_sequence_config(monarch: Mapping[str, Any]) -> dict[str, int]:
+    sequence = _mapping(monarch.get("sequence"), "monarch.sequence")
+    prompt_length = _positive_int(
+        sequence.get("max_prompt_tokens", 1024),
+        "monarch.sequence.max_prompt_tokens",
+    )
+    response_length = _positive_int(
+        sequence.get("max_response_tokens", 1024),
+        "monarch.sequence.max_response_tokens",
+    )
+    return {
+        "max_prompt_tokens": prompt_length,
+        "max_response_tokens": response_length,
+        "max_seq_len": prompt_length + response_length,
+    }
 
 
 def split_worker_gpus(
@@ -111,11 +130,29 @@ def summarize_train_results(train_results: Mapping[Any, Any]) -> dict[str, float
         "clip_fraction_mean": mean("clip_fraction"),
         "active_tokens_total": sum(float(result.active_tokens) for result in results),
         "elapsed_seconds_max": max(float(result.elapsed_seconds) for result in results),
+        "memory_allocated_mean_mb": mean("memory_allocated_mb"),
+        "memory_allocated_max_mb": max(
+            float(result.memory_allocated_mb) for result in results
+        ),
+        "memory_reserved_mean_mb": mean("memory_reserved_mb"),
+        "memory_reserved_max_mb": max(
+            float(result.memory_reserved_mb) for result in results
+        ),
+        "max_memory_allocated_mean_mb": mean("max_memory_allocated_mb"),
+        "max_memory_allocated_max_mb": max(
+            float(result.max_memory_allocated_mb) for result in results
+        ),
+        "max_memory_reserved_mean_mb": mean("max_memory_reserved_mb"),
+        "max_memory_reserved_max_mb": max(
+            float(result.max_memory_reserved_mb) for result in results
+        ),
     }
 
 
 def validate_rl_config(config: Mapping[str, Any]) -> dict[str, Any]:
     monarch = _mapping(config.get("monarch"), "monarch")
+    wandb_config = _mapping(monarch.get("wandb"), "monarch.wandb")
+    sequence = _load_sequence_config(monarch)
     rl_config = _mapping(config.get("rl"), "rl")
     train_actor = _mapping(config.get("train_actor"), "train_actor")
     rollout_actor = _mapping(config.get("rollout_actor"), "rollout_actor")
@@ -149,22 +186,34 @@ def validate_rl_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if not Path(str(path)).expanduser().is_file():
             raise FileNotFoundError(f"{name}.path does not exist: {path}")
 
-    prompt_length = int(rollout_config.get("max_prompt_tokens", 448))
-    response_length = int(rollout_config.get("max_response_tokens", 64))
-    if prompt_length <= 0 or response_length <= 0:
-        raise ValueError("Rollout prompt and response token limits must be positive.")
-    if prompt_length + response_length > int(train_data.get("max_seq_len", 0)):
+    prompt_length = sequence["max_prompt_tokens"]
+    response_length = sequence["max_response_tokens"]
+    max_seq_len = sequence["max_seq_len"]
+    train_max_seq_len = int(train_data.get("max_seq_len", max_seq_len))
+    if train_max_seq_len < max_seq_len:
         raise ValueError(
-            "rollout prompt + response tokens must not exceed "
-            "dataloader.train.max_seq_len."
+            "dataloader.train.max_seq_len must be at least "
+            "monarch.sequence.max_prompt_tokens + "
+            f"max_response_tokens ({train_max_seq_len} vs {max_seq_len})."
         )
-    if response_length < int(rollout_sampling.get("max_tokens", response_length)):
+    rollout_max_tokens = int(rollout_sampling.get("max_tokens", response_length))
+    eval_max_tokens = int(eval_sampling.get("max_tokens", response_length))
+    if response_length < rollout_max_tokens:
         raise ValueError(
-            "rollout max_response_tokens must cover rollout sampling.max_tokens."
+            "monarch.sequence.max_response_tokens must cover "
+            "rollout_actor.rollout.sampling.max_tokens."
         )
-    if prompt_length + response_length > int(engine.get("max_model_len", 0)):
+    if response_length < eval_max_tokens:
         raise ValueError(
-            "rollout prompt + response tokens must not exceed engine.max_model_len."
+            "monarch.sequence.max_response_tokens must cover "
+            "rollout_actor.eval.sampling.max_tokens."
+        )
+    engine_max_model_len = int(engine.get("max_model_len", max_seq_len))
+    if max_seq_len > engine_max_model_len:
+        raise ValueError(
+            "rollout_actor.engine.max_model_len must be at least "
+            "monarch.sequence.max_prompt_tokens + "
+            f"max_response_tokens ({engine_max_model_len} vs {max_seq_len})."
         )
     if int(rollout_sampling.get("n", 1)) < 2:
         raise ValueError("GRPO requires rollout sampling.n >= 2.")
@@ -235,6 +284,11 @@ def validate_rl_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "train_gpus": train_gpus,
         "rollout_gpus": rollout_gpus,
         "worker_env": {str(key): str(value) for key, value in configured_env.items()},
+        "sequence": sequence,
+        "wandb": wandb_config,
+        "gpu_sample_interval_seconds": float(
+            wandb_config.get("gpu_sample_interval_seconds", 1.0)
+        ),
         "shutdown_timeout": shutdown_timeout,
         "max_steps": max_steps,
         "rollout_batch_size": rollout_batch_size,
@@ -249,6 +303,77 @@ def validate_rl_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "eval_epochs": eval_epochs,
         "eval_batch_size": eval_batch_size,
         "eval_sampling": eval_sampling,
+    }
+
+
+def init_wandb_run(
+    *,
+    config_path: Path,
+    config: Mapping[str, Any],
+    settings: Mapping[str, Any],
+) -> Any | None:
+    wandb_config = _mapping(settings.get("wandb"), "monarch.wandb")
+    if not bool(wandb_config.get("enable", False)):
+        return None
+
+    import wandb
+
+    kwargs: dict[str, Any] = {
+        "project": wandb_config.get("project", "nano-agentic-rl"),
+        "name": wandb_config.get("name", config_path.stem),
+        "config": {
+            "config_path": str(config_path),
+            "config": dict(config),
+            "train_gpus": list(settings["train_gpus"]),
+            "rollout_gpus": list(settings["rollout_gpus"]),
+        },
+    }
+    for key in ("entity", "group", "mode", "dir"):
+        if wandb_config.get(key) is not None:
+            kwargs[key] = wandb_config[key]
+    if wandb_config.get("tags") is not None:
+        tags = wandb_config["tags"]
+        kwargs["tags"] = [tags] if isinstance(tags, str) else list(tags)
+
+    run = wandb.init(**kwargs)
+    logger.info("Initialized W&B run: project=%s name=%s.", kwargs["project"], kwargs["name"])
+    return run
+
+
+def log_wandb(run: Any | None, metrics: Mapping[str, Any], *, step: int) -> None:
+    if run is None or not metrics:
+        return
+    run.log(dict(metrics), step=step)
+
+
+def train_wandb_metrics(train_summary: Mapping[str, float]) -> dict[str, float]:
+    return {
+        "train/ranks": train_summary["ranks"],
+        "train/loss_mean": train_summary["loss_mean"],
+        "train/lr_mean": train_summary["lr_mean"],
+        "train/grad_norm_mean": train_summary["grad_norm_mean"],
+        "train/grad_norm_max": train_summary["grad_norm_max"],
+        "train/approx_kl_mean": train_summary["approx_kl_mean"],
+        "train/ratio_mean": train_summary["ratio_mean"],
+        "train/clip_fraction_mean": train_summary["clip_fraction_mean"],
+        "train/active_tokens_total": train_summary["active_tokens_total"],
+        "train/time_max_sec": train_summary["elapsed_seconds_max"],
+        "train/memory_allocated_mean_mb": train_summary["memory_allocated_mean_mb"],
+        "train/memory_allocated_max_mb": train_summary["memory_allocated_max_mb"],
+        "train/memory_reserved_mean_mb": train_summary["memory_reserved_mean_mb"],
+        "train/memory_reserved_max_mb": train_summary["memory_reserved_max_mb"],
+        "train/max_memory_allocated_mean_mb": train_summary[
+            "max_memory_allocated_mean_mb"
+        ],
+        "train/max_memory_allocated_max_mb": train_summary[
+            "max_memory_allocated_max_mb"
+        ],
+        "train/max_memory_reserved_mean_mb": train_summary[
+            "max_memory_reserved_mean_mb"
+        ],
+        "train/max_memory_reserved_max_mb": train_summary[
+            "max_memory_reserved_max_mb"
+        ],
     }
 
 
@@ -316,12 +441,44 @@ async def fill_replay_buffer(
     train_batch_episode_count: int,
     samples_per_prompt: int,
     drop_low_variance: bool,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    started_at = time.perf_counter()
+    requested_groups = 0
     groups_processed = 0
+    accepted_groups = 0
+    dropped_low_variance_groups = 0
+    generated_samples = 0
+    accepted_samples = 0
+    reward_means: list[float] = []
+    reward_stds: list[float] = []
+
+    def metrics() -> dict[str, float]:
+        return {
+            "requested_groups": float(requested_groups),
+            "processed_groups": float(groups_processed),
+            "accepted_groups": float(accepted_groups),
+            "dropped_low_variance_groups": float(dropped_low_variance_groups),
+            "generated_samples": float(generated_samples),
+            "accepted_samples": float(accepted_samples),
+            "effective_sample_rate": (
+                accepted_samples / generated_samples if generated_samples else 0.0
+            ),
+            "effective_group_rate": (
+                accepted_groups / groups_processed if groups_processed else 0.0
+            ),
+            "reward_mean": (
+                sum(reward_means) / len(reward_means) if reward_means else 0.0
+            ),
+            "reward_std_mean": (
+                sum(reward_stds) / len(reward_stds) if reward_stds else 0.0
+            ),
+            "time_sec": time.perf_counter() - started_at,
+        }
+
     while groups_processed < max_groups:
         batch = await replay_buffer.sample.call_one(current_policy_version)
         if batch is not None:
-            return batch
+            return batch, metrics()
 
         status = await replay_buffer.get_status.call_one()
         groups_remaining = max_groups - groups_processed
@@ -349,6 +506,7 @@ async def fill_replay_buffer(
             groups_processed,
             max_groups,
         )
+        requested_groups += planned_groups
 
         dataset_samples = await dataset.next_batch.call_one(planned_groups)
         rollout_outputs = await rollout_actor.chat.call_one(
@@ -366,7 +524,11 @@ async def fill_replay_buffer(
                 [result.reward for result in reward_results]
             )
             groups_processed += 1
+            generated_samples += len(rollout_output.samples)
+            reward_means.append(float(advantage_result.reward_mean))
+            reward_stds.append(float(advantage_result.reward_std))
             if advantage_result.low_variance and drop_low_variance:
+                dropped_low_variance_groups += 1
                 logger.info(
                     "Dropped low-variance rollout group %s (std=%.6f).",
                     dataset_sample.sample_id,
@@ -380,6 +542,8 @@ async def fill_replay_buffer(
                 reward_results,
                 advantage_result.advantages,
             )
+            accepted_groups += 1
+            accepted_samples += len(episodes)
             status = await replay_buffer.add.call_one(episodes)
             logger.info(
                 "Rollout group %s: mean reward=%.3f, std=%.3f, buffer=%d.",
@@ -397,7 +561,7 @@ async def fill_replay_buffer(
             "Replay buffer did not reach a full training batch within "
             f"{max_groups} rollout groups."
         )
-    return batch
+    return batch, metrics()
 
 
 async def run_eval(
@@ -409,7 +573,8 @@ async def run_eval(
     epochs: int,
     sampling_params: Mapping[str, Any],
     step: int | None,
-) -> None:
+) -> dict[str, float]:
+    started_at = time.perf_counter()
     correctness_groups: list[list[float]] = []
     for _ in range(epochs):
         eval_batches = await eval_dataset.all_batches.call_one(batch_size)
@@ -457,6 +622,16 @@ async def run_eval(
             metric.k,
             metric.all_pass_at_k,
         )
+    result = {
+        "time_sec": time.perf_counter() - started_at,
+        "num_groups": float(len(correctness_groups)),
+        "num_samples": float(sum(len(group) for group in correctness_groups)),
+    }
+    for metric in metrics:
+        result[f"pass@{metric.k}"] = metric.pass_at_k
+        result[f"g-pass@{metric.k}"] = metric.g_pass_at_k
+        result[f"all-pass@{metric.k}"] = metric.all_pass_at_k
+    return result
 
 
 async def sync_policy_weights(
@@ -527,6 +702,11 @@ async def run_rl(config_path: Path) -> None:
     config_path = config_path.expanduser().resolve()
     config = load_config(config_path)
     settings = validate_rl_config(config)
+    wandb_run = init_wandb_run(
+        config_path=config_path,
+        config=config,
+        settings=settings,
+    )
     proc_meshes: list[ProcMesh] = []
     train_actors = None
     rollout_actor = None
@@ -616,55 +796,86 @@ async def run_rl(config_path: Path) -> None:
             transfer_port,
             transfer_world_size - 1,
         )
-        update_result = await sync_policy_weights(
-            rollout_actor=rollout_actor,
-            train_actors=train_actors,
-            weight_metadata=weight_metadata,
-            version=policy_version,
-            allow_same_version=True,
-        )
+        async with GpuMonitor(
+            settings["rollout_gpus"],
+            interval_seconds=settings["gpu_sample_interval_seconds"],
+        ) as sync_monitor:
+            update_result = await sync_policy_weights(
+                rollout_actor=rollout_actor,
+                train_actors=train_actors,
+                weight_metadata=weight_metadata,
+                version=policy_version,
+                allow_same_version=True,
+            )
         policy_version = update_result.policy_version
         logger.info(
             "Initial policy sync complete: policy=v%d, NCCL sync=%.2fs.",
             policy_version,
             update_result.elapsed_seconds,
         )
-        await run_eval(
-            eval_dataset=eval_dataset,
-            reward_actor=reward_actor,
-            rollout_actor=rollout_actor,
-            batch_size=settings["eval_batch_size"],
-            epochs=settings["eval_epochs"],
-            sampling_params=settings["eval_sampling"],
-            step=None,
+        async with GpuMonitor(
+            settings["rollout_gpus"],
+            interval_seconds=settings["gpu_sample_interval_seconds"],
+        ) as eval_monitor:
+            eval_metrics = await run_eval(
+                eval_dataset=eval_dataset,
+                reward_actor=reward_actor,
+                rollout_actor=rollout_actor,
+                batch_size=settings["eval_batch_size"],
+                epochs=settings["eval_epochs"],
+                sampling_params=settings["eval_sampling"],
+                step=None,
+            )
+        log_wandb(
+            wandb_run,
+            {
+                "policy/version": float(policy_version),
+                "sync/initial_time_sec": update_result.elapsed_seconds,
+                **prefix_metrics("sync", sync_monitor.summary()),
+                **prefix_metrics("eval", eval_metrics),
+                **prefix_metrics("eval", eval_monitor.summary()),
+            },
+            step=0,
         )
 
         for step in range(1, settings["max_steps"] + 1):
-            batches = await fill_replay_buffer(
-                dataset=train_dataset,
-                reward_actor=reward_actor,
-                advantage_actor=advantage_actor,
-                replay_buffer=replay_buffer,
-                rollout_actor=rollout_actor,
-                current_policy_version=policy_version,
-                rollout_batch_size=settings["rollout_batch_size"],
-                rollout_batch_size_multiplier=settings[
-                    "rollout_batch_size_multiplier"
-                ],
-                max_groups=settings["max_rollout_groups_per_step"],
-                train_batch_episode_count=settings["train_batch_episode_count"],
-                samples_per_prompt=settings["samples_per_prompt"],
-                drop_low_variance=settings["drop_low_variance_groups"],
-            )
-            train_results = await train_actors.train_grpo_step.call(batches)
+            async with GpuMonitor(
+                settings["rollout_gpus"],
+                interval_seconds=settings["gpu_sample_interval_seconds"],
+            ) as rollout_monitor:
+                batches, rollout_metrics = await fill_replay_buffer(
+                    dataset=train_dataset,
+                    reward_actor=reward_actor,
+                    advantage_actor=advantage_actor,
+                    replay_buffer=replay_buffer,
+                    rollout_actor=rollout_actor,
+                    current_policy_version=policy_version,
+                    rollout_batch_size=settings["rollout_batch_size"],
+                    rollout_batch_size_multiplier=settings[
+                        "rollout_batch_size_multiplier"
+                    ],
+                    max_groups=settings["max_rollout_groups_per_step"],
+                    train_batch_episode_count=settings["train_batch_episode_count"],
+                    samples_per_prompt=settings["samples_per_prompt"],
+                    drop_low_variance=settings["drop_low_variance_groups"],
+                )
+            async with GpuMonitor(
+                settings["train_gpus"],
+                interval_seconds=settings["gpu_sample_interval_seconds"],
+            ) as train_monitor:
+                train_results = await train_actors.train_grpo_step.call(batches)
             train_summary = summarize_train_results(train_results)
 
-            update_result = await sync_policy_weights(
-                rollout_actor=rollout_actor,
-                train_actors=train_actors,
-                weight_metadata=weight_metadata,
-                version=policy_version + 1,
-            )
+            async with GpuMonitor(
+                settings["rollout_gpus"],
+                interval_seconds=settings["gpu_sample_interval_seconds"],
+            ) as sync_monitor:
+                update_result = await sync_policy_weights(
+                    rollout_actor=rollout_actor,
+                    train_actors=train_actors,
+                    weight_metadata=weight_metadata,
+                    version=policy_version + 1,
+                )
             policy_version = update_result.policy_version
             logger.info(
                 "RL step %d/%d complete across %.0f rank(s): "
@@ -687,14 +898,36 @@ async def run_rl(config_path: Path) -> None:
                 policy_version,
                 update_result.elapsed_seconds,
             )
+            step_metrics = {
+                "policy/version": float(policy_version),
+                **prefix_metrics("rollout", rollout_metrics),
+                **prefix_metrics("rollout", rollout_monitor.summary()),
+                **train_wandb_metrics(train_summary),
+                **prefix_metrics("train", train_monitor.summary()),
+                "sync/time_sec": update_result.elapsed_seconds,
+                **prefix_metrics("sync", sync_monitor.summary()),
+            }
+            log_wandb(wandb_run, step_metrics, step=step)
             if step % settings["eval_steps"] == 0:
-                await run_eval(
-                    eval_dataset=eval_dataset,
-                    reward_actor=reward_actor,
-                    rollout_actor=rollout_actor,
-                    batch_size=settings["eval_batch_size"],
-                    epochs=settings["eval_epochs"],
-                    sampling_params=settings["eval_sampling"],
+                async with GpuMonitor(
+                    settings["rollout_gpus"],
+                    interval_seconds=settings["gpu_sample_interval_seconds"],
+                ) as eval_monitor:
+                    eval_metrics = await run_eval(
+                        eval_dataset=eval_dataset,
+                        reward_actor=reward_actor,
+                        rollout_actor=rollout_actor,
+                        batch_size=settings["eval_batch_size"],
+                        epochs=settings["eval_epochs"],
+                        sampling_params=settings["eval_sampling"],
+                        step=step,
+                    )
+                log_wandb(
+                    wandb_run,
+                    {
+                        **prefix_metrics("eval", eval_metrics),
+                        **prefix_metrics("eval", eval_monitor.summary()),
+                    },
                     step=step,
                 )
 
@@ -708,6 +941,11 @@ async def run_rl(config_path: Path) -> None:
                 timeout=settings["shutdown_timeout"],
             )
         )
+        if wandb_run is not None:
+            try:
+                wandb_run.finish()
+            except Exception:
+                logger.warning("Failed to finish W&B run cleanly.", exc_info=True)
 
 
 def parse_cli_args() -> argparse.Namespace:

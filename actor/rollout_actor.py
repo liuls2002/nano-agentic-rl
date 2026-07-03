@@ -88,11 +88,26 @@ def _apply_environment(config: Mapping[str, Any]) -> None:
         os.environ[str(name)] = str(value)
 
 
+def _sequence_config(config: Mapping[str, Any]) -> dict[str, int]:
+    monarch_config = _require_mapping(config.get("monarch"), "monarch")
+    sequence = _require_mapping(monarch_config.get("sequence"), "monarch.sequence")
+    prompt_length = int(sequence.get("max_prompt_tokens", 1024))
+    response_length = int(sequence.get("max_response_tokens", 1024))
+    if prompt_length <= 0 or response_length <= 0:
+        raise ValueError("monarch.sequence token limits must be positive.")
+    return {
+        "max_prompt_tokens": prompt_length,
+        "max_response_tokens": response_length,
+        "max_seq_len": prompt_length + response_length,
+    }
+
+
 def _build_engine_kwargs(config: Mapping[str, Any]) -> dict[str, Any]:
     rollout_actor = _require_mapping(config.get("rollout_actor"), "rollout_actor")
     engine_config = _require_mapping(
         rollout_actor.get("engine"), "rollout_actor.engine"
     )
+    sequence = _sequence_config(config)
 
     model_path = engine_config.get("model")
     if not model_path:
@@ -108,6 +123,7 @@ def _build_engine_kwargs(config: Mapping[str, Any]) -> dict[str, Any]:
     engine_config.setdefault("dtype", "bfloat16")
     engine_config.setdefault("gpu_memory_utilization", 0.85)
     engine_config.setdefault("enforce_eager", True)
+    engine_config.setdefault("max_model_len", sequence["max_seq_len"])
     engine_config.setdefault("seed", 0)
     engine_config.setdefault("disable_log_stats", True)
 
@@ -131,6 +147,7 @@ def _build_engine_kwargs(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def _build_default_sampling_config(config: Mapping[str, Any]) -> dict[str, Any]:
     rollout_actor = _require_mapping(config.get("rollout_actor"), "rollout_actor")
+    sequence = _sequence_config(config)
     rollout_config = _require_mapping(
         rollout_actor.get("rollout"), "rollout_actor.rollout"
     )
@@ -147,7 +164,7 @@ def _build_default_sampling_config(config: Mapping[str, Any]) -> dict[str, Any]:
         )
 
     sampling_config.setdefault("n", 1)
-    sampling_config.setdefault("max_tokens", 512)
+    sampling_config.setdefault("max_tokens", sequence["max_response_tokens"])
     sampling_config.setdefault("temperature", 1.0)
     sampling_config.setdefault("top_p", 1.0)
     sampling_config.setdefault("logprobs", 0 if not rollout_config else 1)
@@ -376,23 +393,9 @@ class RolloutActor(Actor):
             rollout_config = _require_mapping(
                 rollout_actor.get("rollout"), "rollout_actor.rollout"
             )
-            eval_config = _require_mapping(
-                rollout_actor.get("eval"), "rollout_actor.eval"
-            )
-            eval_sampling_config = _require_mapping(
-                eval_config.get("sampling"), "rollout_actor.eval.sampling"
-            )
-            max_model_len = int(engine_kwargs.get("max_model_len", 0))
-            eval_max_tokens = int(eval_sampling_config.get("max_tokens", 256))
-            self._max_prompt_tokens = int(
-                rollout_config.get(
-                    "max_prompt_tokens",
-                    max(max_model_len - eval_max_tokens, 1) if max_model_len else 512,
-                )
-            )
-            self._max_response_tokens = int(
-                rollout_config.get("max_response_tokens", eval_max_tokens)
-            )
+            sequence = _sequence_config(config)
+            self._max_prompt_tokens = sequence["max_prompt_tokens"]
+            self._max_response_tokens = sequence["max_response_tokens"]
             weight_sync_config = _require_mapping(
                 rl_config.get("weight_sync"), "rl.weight_sync"
             )
@@ -408,6 +411,11 @@ class RolloutActor(Actor):
                 weight_sync_config.get("packed_num_buffers", 2)
             )
             self._max_model_len = int(engine_kwargs.get("max_model_len", 0))
+            if self._max_model_len < sequence["max_seq_len"]:
+                raise ValueError(
+                    "rollout_actor.engine.max_model_len must be at least "
+                    "monarch.sequence.max_prompt_tokens + max_response_tokens."
+                )
 
             # Import after applying environment variables because vLLM reads many
             # runtime settings during module import and engine construction.

@@ -3,6 +3,19 @@ monarch:
   env:
     # CUDA 13.0 machine has no IB device. All Monarch workers inherit this.
     NCCL_IB_DISABLE: "1"
+  sequence:
+    max_prompt_tokens: 1024
+    max_response_tokens: 1024
+  wandb:
+    enable: true
+    project: nano-agentic-rl
+    name: qwen3-4b-grpo-dapo-17k-high-var
+    # entity: your_wandb_entity      # 可选
+    group: grpo-dapo               # 可选
+    tags: ["qwen3-4b", "grpo", "dapo-17k", "high-variance"]  # 可选
+    mode: online                   # 可选，也可以 offline / disabled
+    dir: outputs/wandb             # 可选
+    gpu_sample_interval_seconds: 1.0
 
 
 rl:
@@ -15,10 +28,8 @@ rl:
     packed_buffer_size_bytes: 536870912 # 512 MiB
     packed_num_buffers: 2
   rollout_batch_size: 4
-  rollout_batch_size_multiplier: 2.0
+  rollout_batch_size_multiplier: 1.5
   max_rollout_groups_per_step: 128
-  max_prompt_tokens: 1024
-  max_response_tokens: 1024
   clip_low: 0.2
   clip_high: 0.28
   drop_low_variance_groups: true
@@ -48,7 +59,6 @@ dataloader:
     data_type: conversation
     chat_template: chatml
     text_keys: messages
-    max_seq_len: 2048
     drop_last: true
     pin_memory: true
     shuffle: true
@@ -127,7 +137,6 @@ rollout_actor:
     tokenizer: /ssd/liuls/data/hub/Qwen3-4B-Instruct-2507
     load_format: dummy
     dtype: bfloat16
-    max_model_len: 2048
     gpu_memory_utilization: 0.8
     enforce_eager: true
     # Enable vLLM's native NCCL receiver used by main_rl.py.
@@ -136,11 +145,8 @@ rollout_actor:
     seed: 42
   
   rollout: 
-    max_prompt_tokens: 1024
-    max_response_tokens: 1024
     sampling:
       n: 8    # grpo
-      max_tokens: 1024
       temperature: 1.0
       top_p: 0.95
       logprobs: 1
@@ -151,7 +157,6 @@ rollout_actor:
     batch_size: 2048
     sampling:
       n: 8    # 每个样本采样n次回答，统计pass@k，g-pass@k指标
-      max_tokens: 1024
       temperature: 0.7
       top_p: 0.95
       logprobs: 0

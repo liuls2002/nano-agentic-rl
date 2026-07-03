@@ -41,6 +41,10 @@ class GRPOTrainStepResult:
     grad_norm: float
     learning_rate: float
     elapsed_seconds: float
+    memory_allocated_mb: float
+    memory_reserved_mb: float
+    max_memory_allocated_mb: float
+    max_memory_reserved_mb: float
 
 
 @dataclass
@@ -67,6 +71,11 @@ def load_veomni_args(config_path: str) -> VeOmniArguments:
     with open(config_path, encoding="utf-8") as config_file:
         raw_config = yaml.safe_load(config_file) or {}
 
+    monarch = _mapping(raw_config.get("monarch"), "monarch")
+    sequence = _mapping(monarch.get("sequence"), "monarch.sequence")
+    default_max_seq_len = int(sequence.get("max_prompt_tokens", 1024)) + int(
+        sequence.get("max_response_tokens", 1024)
+    )
     train_actor = _mapping(raw_config.get("train_actor"), "train_actor")
     dataloader = _mapping(raw_config.get("dataloader"), "dataloader")
     train_loader = _mapping(dataloader.get("train"), "dataloader.train")
@@ -80,7 +89,7 @@ def load_veomni_args(config_path: str) -> VeOmniArguments:
         "data_type": train_loader.get("data_type", "conversation"),
         "chat_template": train_loader.get("chat_template", "default"),
         "text_keys": train_loader.get("text_keys", "messages"),
-        "max_seq_len": int(train_loader.get("max_seq_len", 2048)),
+        "max_seq_len": int(train_loader.get("max_seq_len", default_max_seq_len)),
         "dataloader": {
             "type": train_loader.get("type", "native"),
             "num_workers": int(train_loader.get("num_workers", 0)),
@@ -392,6 +401,8 @@ class TrainActor(Actor):
         base.model.train()
         base.optimizer.zero_grad()
         base.state.global_step += 1
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(base.device)
         synchronize()
 
         micro_batches = []
@@ -445,6 +456,7 @@ class TrainActor(Actor):
         base.lr_scheduler.step()
         base.optimizer.zero_grad()
         self._grpo_step += 1
+        synchronize()
 
         for name in ("loss", "ratio_mean", "approx_kl", "clip_fraction"):
             metric_totals[name] /= num_micro_batches
@@ -454,6 +466,20 @@ class TrainActor(Actor):
             if isinstance(grad_norm, torch.Tensor)
             else float(grad_norm)
         )
+        if torch.cuda.is_available():
+            memory_allocated_mb = torch.cuda.memory_allocated(base.device) / (1024**2)
+            memory_reserved_mb = torch.cuda.memory_reserved(base.device) / (1024**2)
+            max_memory_allocated_mb = (
+                torch.cuda.max_memory_allocated(base.device) / (1024**2)
+            )
+            max_memory_reserved_mb = (
+                torch.cuda.max_memory_reserved(base.device) / (1024**2)
+            )
+        else:
+            memory_allocated_mb = 0.0
+            memory_reserved_mb = 0.0
+            max_memory_allocated_mb = 0.0
+            max_memory_reserved_mb = 0.0
         result = GRPOTrainStepResult(
             step=self._grpo_step,
             loss=metric_totals["loss"],
@@ -464,6 +490,10 @@ class TrainActor(Actor):
             grad_norm=grad_norm_value,
             learning_rate=learning_rate,
             elapsed_seconds=time.perf_counter() - started_at,
+            memory_allocated_mb=memory_allocated_mb,
+            memory_reserved_mb=memory_reserved_mb,
+            max_memory_allocated_mb=max_memory_allocated_mb,
+            max_memory_reserved_mb=max_memory_reserved_mb,
         )
         logger.info(
             "GRPO step %d on rank %d: loss=%.6f, lr=%.3e, "

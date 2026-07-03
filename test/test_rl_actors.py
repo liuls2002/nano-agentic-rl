@@ -218,11 +218,11 @@ def replay_expectations(config_path: Path) -> tuple[int, int, int, int]:
         config = yaml.safe_load(config_file) or {}
     rl_config = config["rl"]
     train_actor = config["train_actor"]
-    rollout_config = config["rollout_actor"]["rollout"]
+    sequence = config.get("monarch", {}).get("sequence", {})
     batch_size_per_rank = int(rl_config["replay_buffer"]["batch_size_per_rank"])
     data_parallel_size = int(train_actor["num_gpus"])
-    prompt_length = int(rollout_config["max_prompt_tokens"])
-    response_length = int(rollout_config["max_response_tokens"])
+    prompt_length = int(sequence.get("max_prompt_tokens", 1024))
+    response_length = int(sequence.get("max_response_tokens", 1024))
     return batch_size_per_rank, data_parallel_size, prompt_length, response_length
 
 
