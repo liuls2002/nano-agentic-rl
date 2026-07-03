@@ -8,8 +8,6 @@ from typing import Sequence
 class PassAtKMetrics:
     k: int
     pass_at_k: float
-    g_pass_at_k: float
-    all_pass_at_k: float
 
 
 def compute_pass_at_k(
@@ -21,26 +19,53 @@ def compute_pass_at_k(
         raise ValueError("At least one correctness group is required.")
 
     any_correct = 0.0
-    mean_correct = 0.0
-    all_correct = 0.0
     for group in correctness_groups:
         if len(group) < k:
             raise ValueError("Each correctness group must contain at least k values.")
-        values = [float(value) for value in group[:k]]
-        any_correct += float(any(value > 0.0 for value in values))
-        mean_correct += sum(values) / k
-        all_correct += float(all(value > 0.0 for value in values))
+        all_values = [float(value) for value in group]
+        num_samples = len(all_values)
+        num_correct = sum(1 for value in all_values if value > 0.0)
+        any_correct += _estimate_pass_at_k(num_samples, num_correct, k)
 
     count = float(len(correctness_groups))
     return PassAtKMetrics(
         k=k,
         pass_at_k=any_correct / count,
-        g_pass_at_k=mean_correct / count,
-        all_pass_at_k=all_correct / count,
     )
 
 
 def compute_pass_at_k_range(
     correctness_groups: Sequence[Sequence[float | int | bool]], max_k: int
 ) -> list[PassAtKMetrics]:
-    return [compute_pass_at_k(correctness_groups, k) for k in range(1, max_k + 1)]
+    return [
+        compute_pass_at_k(correctness_groups, k)
+        for k in slime_pass_at_k_values(max_k)
+    ]
+
+
+def slime_pass_at_k_values(max_k: int) -> list[int]:
+    if max_k <= 0:
+        raise ValueError("max_k must be positive.")
+    values = []
+    k = 1
+    while k <= max_k:
+        values.append(k)
+        k *= 2
+    return values
+
+
+def _estimate_pass_at_k(num_samples: int, num_correct: int, k: int) -> float:
+    """Slime/OpenAI-style unbiased pass@k estimator."""
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive.")
+    if k <= 0:
+        raise ValueError("k must be positive.")
+    if k > num_samples:
+        raise ValueError("k must not exceed num_samples.")
+    if num_samples - num_correct < k:
+        return 1.0
+
+    product = 1.0
+    for value in range(num_samples - num_correct + 1, num_samples + 1):
+        product *= 1.0 - k / value
+    return 1.0 - product

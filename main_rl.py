@@ -238,16 +238,19 @@ def validate_rl_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("RL rollout batch size and group limit must be positive.")
     if rollout_batch_size_multiplier <= 0:
         raise ValueError("rl.rollout_batch_size_multiplier must be positive.")
-    replay = _mapping(rl_config.get("replay_buffer"), "rl.replay_buffer")
-    batch_size_per_rank = int(replay.get("batch_size_per_rank", 1))
-    expected_global_batch = batch_size_per_rank * train_num_gpus
+    dynamic_sampling = _mapping(
+        rl_config.get("dynamic_sampling"), "rl.dynamic_sampling"
+    )
+    dynamic_sampling_enabled = bool(dynamic_sampling.get("enabled", True))
     configured_global_batch = int(train_config.get("global_batch_size", 0))
-    if expected_global_batch != configured_global_batch:
+    if configured_global_batch <= 0:
+        raise ValueError("train_actor.train.global_batch_size must be positive.")
+    if configured_global_batch % train_num_gpus:
         raise ValueError(
-            "Replay buffer batch_size_per_rank * train DP size must equal "
-            f"train_actor.train.global_batch_size ({expected_global_batch} vs "
-            f"{configured_global_batch})."
+            "train_actor.train.global_batch_size must be divisible by "
+            f"train_actor.num_gpus ({configured_global_batch} vs {train_num_gpus})."
         )
+    expected_global_batch = configured_global_batch
     samples_per_prompt = int(rollout_sampling.get("n", 1))
     if expected_global_batch % samples_per_prompt:
         raise ValueError(
@@ -296,9 +299,15 @@ def validate_rl_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "max_rollout_groups_per_step": max_rollout_groups,
         "train_batch_episode_count": expected_global_batch,
         "samples_per_prompt": samples_per_prompt,
-        "drop_low_variance_groups": bool(
-            rl_config.get("drop_low_variance_groups", False)
-        ),
+        "max_prompt_tokens": prompt_length,
+        "max_response_tokens": response_length,
+        "dynamic_sampling_enabled": dynamic_sampling_enabled,
+        "dynamic_sampling_filter_low_variance": dynamic_sampling_enabled
+        and bool(dynamic_sampling.get("filter_low_variance_groups", True)),
+        "dynamic_sampling_filter_overlong_prompts": dynamic_sampling_enabled
+        and bool(dynamic_sampling.get("filter_overlong_prompts", True)),
+        "dynamic_sampling_filter_overlong_responses": dynamic_sampling_enabled
+        and bool(dynamic_sampling.get("filter_overlong_responses", True)),
         "eval_steps": eval_steps,
         "eval_epochs": eval_epochs,
         "eval_batch_size": eval_batch_size,
@@ -377,6 +386,105 @@ def train_wandb_metrics(train_summary: Mapping[str, float]) -> dict[str, float]:
     }
 
 
+def _float_metric(metrics: Mapping[str, Any], key: str, default: float = 0.0) -> float:
+    value = metrics.get(key, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def summarize_lengths(lengths: Sequence[int]) -> dict[str, float]:
+    if not lengths:
+        return {
+            "response_tokens_mean": 0.0,
+            "response_tokens_p95": 0.0,
+            "response_tokens_max": 0.0,
+        }
+    sorted_lengths = sorted(int(length) for length in lengths)
+    p95_index = min(
+        len(sorted_lengths) - 1,
+        max(0, math.ceil(0.95 * len(sorted_lengths)) - 1),
+    )
+    return {
+        "response_tokens_mean": sum(sorted_lengths) / len(sorted_lengths),
+        "response_tokens_p95": float(sorted_lengths[p95_index]),
+        "response_tokens_max": float(sorted_lengths[-1]),
+    }
+
+
+def core_eval_wandb_metrics(eval_metrics: Mapping[str, Any]) -> dict[str, float]:
+    result = {
+        "core/eval_accuracy": _float_metric(eval_metrics, "accuracy"),
+        "core/eval_reward_mean": _float_metric(eval_metrics, "reward_mean"),
+        "core/eval_time_sec": _float_metric(eval_metrics, "time_sec"),
+        "core/eval_truncated_sample_rate": _float_metric(
+            eval_metrics, "truncated_sample_rate"
+        ),
+        "core/eval_response_tokens_mean": _float_metric(
+            eval_metrics, "response_tokens_mean"
+        ),
+        "core/eval_response_tokens_p95": _float_metric(
+            eval_metrics, "response_tokens_p95"
+        ),
+    }
+    pass_keys = []
+    for key in eval_metrics:
+        if not str(key).startswith("pass@"):
+            continue
+        try:
+            pass_keys.append((int(str(key).split("@", 1)[1]), str(key)))
+        except ValueError:
+            continue
+    if pass_keys:
+        pass_keys.sort()
+        pass_dict = dict(pass_keys)
+        if 1 in pass_dict:
+            result["core/eval_pass_at_1"] = _float_metric(
+                eval_metrics, pass_dict[1]
+            )
+        max_k, max_key = pass_keys[-1]
+        result[f"core/eval_pass_at_{max_k}"] = _float_metric(eval_metrics, max_key)
+    return result
+
+
+def core_step_wandb_metrics(
+    *,
+    policy_version: int,
+    train_summary: Mapping[str, Any],
+    rollout_metrics: Mapping[str, Any],
+    sync_time_sec: float,
+) -> dict[str, float]:
+    return {
+        "core/policy_version": float(policy_version),
+        "core/train_loss": _float_metric(train_summary, "loss_mean"),
+        "core/train_lr": _float_metric(train_summary, "lr_mean"),
+        "core/train_grad_norm": _float_metric(train_summary, "grad_norm_mean"),
+        "core/train_approx_kl": _float_metric(train_summary, "approx_kl_mean"),
+        "core/train_active_tokens": _float_metric(
+            train_summary, "active_tokens_total"
+        ),
+        "core/train_time_sec": _float_metric(
+            train_summary, "elapsed_seconds_max"
+        ),
+        "core/rollout_effective_group_rate": _float_metric(
+            rollout_metrics, "effective_group_rate"
+        ),
+        "core/rollout_reward_mean": _float_metric(rollout_metrics, "reward_mean"),
+        "core/rollout_truncated_sample_rate": _float_metric(
+            rollout_metrics, "truncated_sample_rate"
+        ),
+        "core/rollout_response_tokens_mean": _float_metric(
+            rollout_metrics, "response_tokens_mean"
+        ),
+        "core/rollout_response_tokens_p95": _float_metric(
+            rollout_metrics, "response_tokens_p95"
+        ),
+        "core/rollout_time_sec": _float_metric(rollout_metrics, "time_sec"),
+        "core/sync_time_sec": float(sync_time_sec),
+    }
+
+
 def reserve_local_port() -> tuple[str, int]:
     """Reserve a single-node rendezvous address for the NCCL transfer group."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -440,15 +548,26 @@ async def fill_replay_buffer(
     max_groups: int,
     train_batch_episode_count: int,
     samples_per_prompt: int,
-    drop_low_variance: bool,
+    max_prompt_tokens: int,
+    max_response_tokens: int,
+    dynamic_sampling_filter_low_variance: bool,
+    dynamic_sampling_filter_overlong_prompts: bool,
+    dynamic_sampling_filter_overlong_responses: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     started_at = time.perf_counter()
     requested_groups = 0
     groups_processed = 0
     accepted_groups = 0
-    dropped_low_variance_groups = 0
+    dynamic_sampling_dropped_low_variance_groups = 0
+    dynamic_sampling_dropped_overlong_prompt_groups = 0
+    dynamic_sampling_dropped_overlong_response_groups = 0
+    dynamic_sampling_dropped_overlong_responses = 0
+    dynamic_sampling_dropped_insufficient_sample_groups = 0
     generated_samples = 0
+    truncated_samples = 0
+    truncated_groups = 0
     accepted_samples = 0
+    response_token_lengths: list[int] = []
     reward_means: list[float] = []
     reward_stds: list[float] = []
 
@@ -457,8 +576,29 @@ async def fill_replay_buffer(
             "requested_groups": float(requested_groups),
             "processed_groups": float(groups_processed),
             "accepted_groups": float(accepted_groups),
-            "dropped_low_variance_groups": float(dropped_low_variance_groups),
+            "dynamic_sampling/dropped_low_variance_groups": float(
+                dynamic_sampling_dropped_low_variance_groups
+            ),
+            "dynamic_sampling/dropped_overlong_prompt_groups": float(
+                dynamic_sampling_dropped_overlong_prompt_groups
+            ),
+            "dynamic_sampling/dropped_overlong_response_groups": float(
+                dynamic_sampling_dropped_overlong_response_groups
+            ),
+            "dynamic_sampling/dropped_overlong_responses": float(
+                dynamic_sampling_dropped_overlong_responses
+            ),
+            "dynamic_sampling/dropped_insufficient_sample_groups": float(
+                dynamic_sampling_dropped_insufficient_sample_groups
+            ),
             "generated_samples": float(generated_samples),
+            "truncated_samples": float(truncated_samples),
+            "truncated_groups": float(truncated_groups),
+            "truncated_sample_rate": (
+                truncated_samples / generated_samples
+                if generated_samples
+                else 0.0
+            ),
             "accepted_samples": float(accepted_samples),
             "effective_sample_rate": (
                 accepted_samples / generated_samples if generated_samples else 0.0
@@ -473,6 +613,7 @@ async def fill_replay_buffer(
                 sum(reward_stds) / len(reward_stds) if reward_stds else 0.0
             ),
             "time_sec": time.perf_counter() - started_at,
+            **summarize_lengths(response_token_lengths),
         }
 
     while groups_processed < max_groups:
@@ -509,6 +650,34 @@ async def fill_replay_buffer(
         requested_groups += planned_groups
 
         dataset_samples = await dataset.next_batch.call_one(planned_groups)
+        if dynamic_sampling_filter_overlong_prompts:
+            prompt_lengths = await dataset.count_tokens.call_one(
+                [sample.messages for sample in dataset_samples]
+            )
+            if len(prompt_lengths) != len(dataset_samples):
+                raise RuntimeError("Dataset prompt token counts do not match batch size.")
+            prompt_filtered_samples = []
+            for dataset_sample, prompt_length in zip(
+                dataset_samples, prompt_lengths
+            ):
+                if groups_processed >= max_groups:
+                    break
+                if int(prompt_length) > max_prompt_tokens:
+                    groups_processed += 1
+                    dynamic_sampling_dropped_overlong_prompt_groups += 1
+                    logger.info(
+                        "Dynamic sampling dropped group %s before rollout: "
+                        "prompt length %d > %d.",
+                        dataset_sample.sample_id,
+                        int(prompt_length),
+                        max_prompt_tokens,
+                    )
+                    continue
+                prompt_filtered_samples.append(dataset_sample)
+            dataset_samples = prompt_filtered_samples
+            if not dataset_samples:
+                continue
+
         rollout_outputs = await rollout_actor.chat.call_one(
             [sample.messages for sample in dataset_samples]
         )
@@ -516,29 +685,81 @@ async def fill_replay_buffer(
             raise RuntimeError("Dataset and rollout batch sizes do not match.")
 
         for dataset_sample, rollout_output in zip(dataset_samples, rollout_outputs):
+            groups_processed += 1
+            generated_samples += len(rollout_output.samples)
+            response_token_lengths.extend(
+                len(sample.token_ids) for sample in rollout_output.samples
+            )
+            truncated_in_group = sum(
+                1
+                for sample in rollout_output.samples
+                if sample.finish_reason == "length"
+            )
+            truncated_samples += truncated_in_group
+            if truncated_in_group:
+                truncated_groups += 1
+            if (
+                dynamic_sampling_filter_overlong_prompts
+                and len(rollout_output.prompt_token_ids) > max_prompt_tokens
+            ):
+                dynamic_sampling_dropped_overlong_prompt_groups += 1
+                logger.info(
+                    "Dynamic sampling dropped group %s: prompt length %d > %d.",
+                    dataset_sample.sample_id,
+                    len(rollout_output.prompt_token_ids),
+                    max_prompt_tokens,
+                )
+                continue
+
+            valid_samples = []
+            for sample in rollout_output.samples:
+                overlong_response = (
+                    len(sample.token_ids) > max_response_tokens
+                    or sample.finish_reason == "length"
+                )
+                if dynamic_sampling_filter_overlong_responses and overlong_response:
+                    dynamic_sampling_dropped_overlong_responses += 1
+                    continue
+                valid_samples.append(sample)
+            if len(valid_samples) != len(rollout_output.samples):
+                dynamic_sampling_dropped_overlong_response_groups += 1
+            if len(valid_samples) < 2:
+                dynamic_sampling_dropped_insufficient_sample_groups += 1
+                logger.info(
+                    "Dynamic sampling dropped group %s: only %d valid response(s) after length filtering.",
+                    dataset_sample.sample_id,
+                    len(valid_samples),
+                )
+                continue
+
             reward_results = await reward_actor.evaluate_batch.call_one(
-                [sample.text for sample in rollout_output.samples],
-                [dataset_sample.target] * len(rollout_output.samples),
+                [sample.text for sample in valid_samples],
+                [dataset_sample.target] * len(valid_samples),
             )
             advantage_result = await advantage_actor.compute.call_one(
                 [result.reward for result in reward_results]
             )
-            groups_processed += 1
-            generated_samples += len(rollout_output.samples)
             reward_means.append(float(advantage_result.reward_mean))
             reward_stds.append(float(advantage_result.reward_std))
-            if advantage_result.low_variance and drop_low_variance:
-                dropped_low_variance_groups += 1
+            if advantage_result.low_variance and dynamic_sampling_filter_low_variance:
+                dynamic_sampling_dropped_low_variance_groups += 1
                 logger.info(
-                    "Dropped low-variance rollout group %s (std=%.6f).",
+                    "Dynamic sampling dropped low-variance group %s (std=%.6f).",
                     dataset_sample.sample_id,
                     advantage_result.reward_std,
                 )
                 continue
 
+            filtered_rollout_output = RolloutOutput(
+                prompt=rollout_output.prompt,
+                prompt_token_ids=rollout_output.prompt_token_ids,
+                samples=valid_samples,
+                policy_version=rollout_output.policy_version,
+                num_cached_tokens=rollout_output.num_cached_tokens,
+            )
             episodes = build_episodes(
                 dataset_sample,
-                rollout_output,
+                filtered_rollout_output,
                 reward_results,
                 advantage_result.advantages,
             )
@@ -576,6 +797,9 @@ async def run_eval(
 ) -> dict[str, float]:
     started_at = time.perf_counter()
     correctness_groups: list[list[float]] = []
+    reward_groups: list[list[float]] = []
+    truncated_samples = 0
+    response_token_lengths: list[int] = []
     for _ in range(epochs):
         eval_batches = await eval_dataset.all_batches.call_one(batch_size)
         for dataset_samples in eval_batches:
@@ -591,6 +815,14 @@ async def run_eval(
             for dataset_sample, rollout_output in zip(
                 dataset_samples, rollout_outputs
             ):
+                response_token_lengths.extend(
+                    len(sample.token_ids) for sample in rollout_output.samples
+                )
+                truncated_samples += sum(
+                    1
+                    for sample in rollout_output.samples
+                    if sample.finish_reason == "length"
+                )
                 reward_results = await reward_actor.evaluate_batch.call_one(
                     [sample.text for sample in rollout_output.samples],
                     [dataset_sample.target] * len(rollout_output.samples),
@@ -601,6 +833,7 @@ async def run_eval(
                         for result in reward_results
                     ]
                 )
+                reward_groups.append([float(result.reward) for result in reward_results])
     logger.info(
         "Eval %s processed %d sample group(s) across %d epoch(s).",
         "baseline" if step is None else f"step {step}",
@@ -611,26 +844,51 @@ async def run_eval(
     max_k = int(sampling_params.get("n", 1))
     metrics = compute_pass_at_k_range(correctness_groups, max_k)
     step_label = "baseline" if step is None else f"step {step}"
+    num_samples = float(sum(len(group) for group in correctness_groups))
+    accuracy = (
+        sum(sum(group) for group in correctness_groups) / num_samples
+        if num_samples
+        else 0.0
+    )
+    reward_sample_count = float(sum(len(group) for group in reward_groups))
+    reward_mean = (
+        sum(sum(group) for group in reward_groups) / reward_sample_count
+        if reward_sample_count
+        else 0.0
+    )
+    truncated_sample_rate = (
+        truncated_samples / num_samples if num_samples else 0.0
+    )
+    response_length_metrics = summarize_lengths(response_token_lengths)
+    logger.info(
+        "Eval %s: accuracy=%.4f, reward_mean=%.4f, truncated=%.4f, "
+        "response_len_mean=%.1f, response_len_p95=%.0f.",
+        step_label,
+        accuracy,
+        reward_mean,
+        truncated_sample_rate,
+        response_length_metrics["response_tokens_mean"],
+        response_length_metrics["response_tokens_p95"],
+    )
     for metric in metrics:
         logger.info(
-            "Eval %s: pass@%d=%.4f, g-pass@%d=%.4f, all-pass@%d=%.4f.",
+            "Eval %s: pass@%d=%.4f.",
             step_label,
             metric.k,
             metric.pass_at_k,
-            metric.k,
-            metric.g_pass_at_k,
-            metric.k,
-            metric.all_pass_at_k,
         )
     result = {
         "time_sec": time.perf_counter() - started_at,
         "num_groups": float(len(correctness_groups)),
-        "num_samples": float(sum(len(group) for group in correctness_groups)),
+        "num_samples": num_samples,
+        "accuracy": accuracy,
+        "reward_mean": reward_mean,
+        "truncated_samples": float(truncated_samples),
+        "truncated_sample_rate": truncated_sample_rate,
+        **response_length_metrics,
     }
     for metric in metrics:
         result[f"pass@{metric.k}"] = metric.pass_at_k
-        result[f"g-pass@{metric.k}"] = metric.g_pass_at_k
-        result[f"all-pass@{metric.k}"] = metric.all_pass_at_k
     return result
 
 
@@ -826,14 +1084,19 @@ async def run_rl(config_path: Path) -> None:
                 sampling_params=settings["eval_sampling"],
                 step=None,
             )
+        sync_gpu_metrics = sync_monitor.summary()
+        eval_gpu_metrics = eval_monitor.summary()
         log_wandb(
             wandb_run,
             {
                 "policy/version": float(policy_version),
+                "core/policy_version": float(policy_version),
                 "sync/initial_time_sec": update_result.elapsed_seconds,
-                **prefix_metrics("sync", sync_monitor.summary()),
+                "core/sync_time_sec": update_result.elapsed_seconds,
+                **core_eval_wandb_metrics(eval_metrics),
+                **prefix_metrics("sync", sync_gpu_metrics),
                 **prefix_metrics("eval", eval_metrics),
-                **prefix_metrics("eval", eval_monitor.summary()),
+                **prefix_metrics("eval", eval_gpu_metrics),
             },
             step=0,
         )
@@ -857,7 +1120,17 @@ async def run_rl(config_path: Path) -> None:
                     max_groups=settings["max_rollout_groups_per_step"],
                     train_batch_episode_count=settings["train_batch_episode_count"],
                     samples_per_prompt=settings["samples_per_prompt"],
-                    drop_low_variance=settings["drop_low_variance_groups"],
+                    max_prompt_tokens=settings["max_prompt_tokens"],
+                    max_response_tokens=settings["max_response_tokens"],
+                    dynamic_sampling_filter_low_variance=settings[
+                        "dynamic_sampling_filter_low_variance"
+                    ],
+                    dynamic_sampling_filter_overlong_prompts=settings[
+                        "dynamic_sampling_filter_overlong_prompts"
+                    ],
+                    dynamic_sampling_filter_overlong_responses=settings[
+                        "dynamic_sampling_filter_overlong_responses"
+                    ],
                 )
             async with GpuMonitor(
                 settings["train_gpus"],
@@ -898,14 +1171,23 @@ async def run_rl(config_path: Path) -> None:
                 policy_version,
                 update_result.elapsed_seconds,
             )
+            rollout_gpu_metrics = rollout_monitor.summary()
+            train_gpu_metrics = train_monitor.summary()
+            sync_gpu_metrics = sync_monitor.summary()
             step_metrics = {
                 "policy/version": float(policy_version),
                 **prefix_metrics("rollout", rollout_metrics),
-                **prefix_metrics("rollout", rollout_monitor.summary()),
+                **prefix_metrics("rollout", rollout_gpu_metrics),
                 **train_wandb_metrics(train_summary),
-                **prefix_metrics("train", train_monitor.summary()),
+                **prefix_metrics("train", train_gpu_metrics),
                 "sync/time_sec": update_result.elapsed_seconds,
-                **prefix_metrics("sync", sync_monitor.summary()),
+                **prefix_metrics("sync", sync_gpu_metrics),
+                **core_step_wandb_metrics(
+                    policy_version=policy_version,
+                    train_summary=train_summary,
+                    rollout_metrics=rollout_metrics,
+                    sync_time_sec=update_result.elapsed_seconds,
+                ),
             }
             log_wandb(wandb_run, step_metrics, step=step)
             if step % settings["eval_steps"] == 0:
@@ -922,11 +1204,13 @@ async def run_rl(config_path: Path) -> None:
                         sampling_params=settings["eval_sampling"],
                         step=step,
                     )
+                eval_gpu_metrics = eval_monitor.summary()
                 log_wandb(
                     wandb_run,
                     {
+                        **core_eval_wandb_metrics(eval_metrics),
                         **prefix_metrics("eval", eval_metrics),
-                        **prefix_metrics("eval", eval_monitor.summary()),
+                        **prefix_metrics("eval", eval_gpu_metrics),
                     },
                     step=step,
                 )

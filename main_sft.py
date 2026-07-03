@@ -246,6 +246,7 @@ async def run_eval(
     step: int | None,
 ) -> None:
     correctness_groups: list[list[float]] = []
+    reward_groups: list[list[float]] = []
     for _ in range(epochs):
         eval_batches = await eval_dataset.all_batches.call_one(batch_size)
         for dataset_samples in eval_batches:
@@ -267,6 +268,7 @@ async def run_eval(
                         for result in reward_results
                     ]
                 )
+                reward_groups.append([float(result.reward) for result in reward_results])
 
     logger.info(
         "Eval %s processed %d sample group(s) across %d epoch(s).",
@@ -277,16 +279,30 @@ async def run_eval(
     max_k = int(sampling_params.get("n", 1))
     metrics = compute_pass_at_k_range(correctness_groups, max_k)
     step_label = "baseline" if step is None else f"step {step}"
+    num_samples = float(sum(len(group) for group in correctness_groups))
+    accuracy = (
+        sum(sum(group) for group in correctness_groups) / num_samples
+        if num_samples
+        else 0.0
+    )
+    reward_sample_count = float(sum(len(group) for group in reward_groups))
+    reward_mean = (
+        sum(sum(group) for group in reward_groups) / reward_sample_count
+        if reward_sample_count
+        else 0.0
+    )
+    logger.info(
+        "Eval %s: accuracy=%.4f, reward_mean=%.4f.",
+        step_label,
+        accuracy,
+        reward_mean,
+    )
     for metric in metrics:
         logger.info(
-            "Eval %s: pass@%d=%.4f, g-pass@%d=%.4f, all-pass@%d=%.4f.",
+            "Eval %s: pass@%d=%.4f.",
             step_label,
             metric.k,
             metric.pass_at_k,
-            metric.k,
-            metric.g_pass_at_k,
-            metric.k,
-            metric.all_pass_at_k,
         )
 
 

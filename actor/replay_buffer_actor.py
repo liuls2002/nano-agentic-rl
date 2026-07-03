@@ -41,21 +41,32 @@ def _load_settings(config_path: str) -> dict[str, Any]:
     sequence = monarch_config.get("sequence", {})
     if not isinstance(sequence, dict):
         raise ValueError("monarch.sequence must be a mapping.")
+    train_config = train_actor.get("train", {})
+    if not isinstance(train_config, dict):
+        raise ValueError("train_actor.train must be a mapping.")
     train_num_gpus = int(train_actor.get("num_gpus", 0))
     if train_num_gpus <= 0:
         raise ValueError("train_actor.num_gpus must be positive.")
+    global_batch_size = int(train_config.get("global_batch_size", 0))
+    if global_batch_size <= 0:
+        raise ValueError("train_actor.train.global_batch_size must be positive.")
+    if global_batch_size % train_num_gpus:
+        raise ValueError(
+            "train_actor.train.global_batch_size must be divisible by "
+            f"train_actor.num_gpus ({global_batch_size} vs {train_num_gpus})."
+        )
     prompt_length = int(sequence.get("max_prompt_tokens", 1024))
     response_length = int(sequence.get("max_response_tokens", 1024))
     return {
         "capacity": int(replay.get("capacity", 256)),
-        "batch_size_per_rank": int(replay.get("batch_size_per_rank", 1)),
+        "batch_size_per_rank": global_batch_size // train_num_gpus,
         "max_policy_age": int(replay.get("max_policy_age", 0)),
         "consume_samples": bool(replay.get("consume_samples", True)),
         "seed": int(replay.get("seed", 0)),
         "data_parallel_size": train_num_gpus,
         "prompt_length": prompt_length,
         "response_length": response_length,
-        "mask_truncated": bool(rl_config.get("mask_truncated_responses", False)),
+        "mask_truncated": bool(replay.get("mask_truncated", False)),
     }
 
 

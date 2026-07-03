@@ -21,8 +21,11 @@ monarch:
 #   max_rollout_groups_per_step: 32
 #   clip_low: 0.2
 #   clip_high: 0.28
-#   drop_low_variance_groups: true
-#   mask_truncated_responses: false
+#   dynamic_sampling:
+#     enabled: true
+#     filter_low_variance_groups: true
+#     filter_overlong_prompts: true
+#     filter_overlong_responses: true
 #   reward:
 #     correctness_weight: 1.0
 #     format_weight: 0.0
@@ -31,11 +34,10 @@ monarch:
 #     epsilon: 1.0e-4
 #     minimum_group_std: 1.0e-3
 #   replay_buffer:
-#     # Four samples on each of two VeOmni ranks consume one 8-sample GRPO group.
-#     batch_size_per_rank: 8
 #     capacity: 256
 #     max_policy_age: 0
 #     consume_samples: true
+#     mask_truncated: true
 #     seed: 42
 
 

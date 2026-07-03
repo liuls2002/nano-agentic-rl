@@ -6,16 +6,20 @@ import json
 import logging
 import math
 import os
-import re
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from actor.reward_advantage_actor import answers_match, extract_answer, extract_target_answer
+
 DEFAULT_DATA_PATH = REPO_ROOT / "data" / "train" / "dapo-math-17k.jsonl"
 DEFAULT_OUTPUT_PATH = REPO_ROOT / "outputs" / "rollout_stats" / "train_rollout_n8.json"
 DEFAULT_MODEL_PATH = Path("/ssd/liuls/data/hub/Qwen3-4B-Instruct-2507")
@@ -37,8 +41,6 @@ TOP_P = 0.95
 CORRECTNESS_TOLERANCE = Decimal("1e-6")
 LOW_VARIANCE_STD_THRESHOLD = 1.0e-3
 
-ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.I | re.S)
-NUMBER_PATTERN = re.compile(r"[-+]?(?:\d[\d,]*\.?\d*|\.\d+)")
 logger = logging.getLogger("rollout_dataset_stats")
 
 
@@ -108,29 +110,11 @@ def load_samples(path: Path, max_samples: int | None) -> list[dict[str, Any]]:
     return samples
 
 
-def extract_numeric_answer(text: str) -> str | None:
-    tagged = ANSWER_PATTERN.findall(text)
-    search_text = tagged[-1] if tagged else text
-    matches = NUMBER_PATTERN.findall(search_text)
-    return matches[-1].replace(",", "") if matches else None
-
-
-def as_decimal(text: str | None) -> Decimal | None:
-    if text is None:
-        return None
-    try:
-        return Decimal(text.strip().replace(",", ""))
-    except (InvalidOperation, AttributeError):
-        return None
-
-
 def is_correct(response: str, target: str) -> bool:
-    predicted = as_decimal(extract_numeric_answer(response))
-    expected = as_decimal(extract_numeric_answer(target))
-    return (
-        predicted is not None
-        and expected is not None
-        and abs(predicted - expected) <= CORRECTNESS_TOLERANCE
+    return answers_match(
+        extract_answer(response),
+        extract_target_answer(target),
+        CORRECTNESS_TOLERANCE,
     )
 
 

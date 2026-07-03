@@ -5,14 +5,14 @@ monarch:
     NCCL_IB_DISABLE: "1"
   sequence:
     max_prompt_tokens: 1024
-    max_response_tokens: 1024
+    max_response_tokens: 2048
   wandb:
     enable: true
     project: nano-agentic-rl
-    name: qwen3-4b-grpo-dapo-17k-high-var
+    name: qwen2_5_1_5b_grpo
     # entity: your_wandb_entity      # 可选
     group: grpo-dapo               # 可选
-    tags: ["qwen3-4b", "grpo", "dapo-17k", "high-variance"]  # 可选
+    tags: ["qwen2.5-1.5b", "grpo", "dapo-17k"]  # 可选
     mode: online                   # 可选，也可以 offline / disabled
     dir: outputs/wandb             # 可选
     gpu_sample_interval_seconds: 1.0
@@ -32,28 +32,30 @@ rl:
   max_rollout_groups_per_step: 128
   clip_low: 0.2
   clip_high: 0.28
-  drop_low_variance_groups: true
-  mask_truncated_responses: false
+  dynamic_sampling:
+    enabled: true
+    filter_low_variance_groups: true
+    filter_overlong_prompts: false
+    filter_overlong_responses: false
   reward:
     correctness_weight: 1.0
-    format_weight: 0.0
+    format_weight: 0.1
     tolerance: 1.0e-6
   advantage:
-    epsilon: 1.0e-4
+    epsilon: 1.0e-6
     minimum_group_std: 1.0e-3
   replay_buffer:
-    # Four samples on each of two VeOmni ranks consume one 8-sample GRPO group.
-    batch_size_per_rank: 8
-    capacity: 256
+    capacity: 1024
     max_policy_age: 0
     consume_samples: true
+    mask_truncated: true
     seed: 42
 
 
 dataloader:
   train:
     type: native
-    path: /ssd/liuls/projects/hw/nano-agentic-rl/data/train/dapo-math-17k_high_variance_n8.jsonl
+    path: /ssd/liuls/projects/hw/nano-agentic-rl/data/train/dapo-math-17k.jsonl
     max_samples: -1   # -1表示取全部
     datasets_type: mapping
     data_type: conversation
@@ -72,8 +74,8 @@ train_actor:
   backend: veomni
   num_gpus: 4
   model:
-    model_path: /ssd/liuls/data/hub/Qwen3-4B-Instruct-2507
-    tokenizer_path: /ssd/liuls/data/hub/Qwen3-4B-Instruct-2507
+    model_path: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
+    tokenizer_path: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
     ops_implementation:
       attn_implementation: sdpa
       moe_implementation: eager
@@ -133,8 +135,8 @@ rollout_actor:
     data_parallel_backend: mp
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
-    model: /ssd/liuls/data/hub/Qwen3-4B-Instruct-2507  # 模型应该从trainer在线更新过来
-    tokenizer: /ssd/liuls/data/hub/Qwen3-4B-Instruct-2507
+    model: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct  # 模型应该从trainer在线更新过来
+    tokenizer: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
     load_format: dummy
     dtype: bfloat16
     gpu_memory_utilization: 0.8
@@ -156,7 +158,7 @@ rollout_actor:
     eval_epochs: 1
     batch_size: 2048
     sampling:
-      n: 8    # 每个样本采样n次回答，统计pass@k，g-pass@k指标
-      temperature: 0.7
+      n: 8   # 每个样本采样n次回答，统计pass@k，g-pass@k指标
+      temperature: 1.0
       top_p: 0.95
       logprobs: 0

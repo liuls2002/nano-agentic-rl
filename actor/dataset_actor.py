@@ -5,7 +5,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import yaml
 from monarch.actor import Actor, endpoint
@@ -84,6 +84,22 @@ def _prompt_text(messages: list[dict[str, str]]) -> str:
     raise ValueError("DatasetSample messages must contain a user message.")
 
 
+def _tokenized_length(tokenized: Any) -> int:
+    if isinstance(tokenized, Mapping):
+        if "input_ids" not in tokenized:
+            raise ValueError("Tokenized chat template output has no input_ids.")
+        tokenized = tokenized["input_ids"]
+    if hasattr(tokenized, "tolist"):
+        tokenized = tokenized.tolist()
+    if (
+        isinstance(tokenized, list)
+        and tokenized
+        and isinstance(tokenized[0], list)
+    ):
+        tokenized = tokenized[0]
+    return len(tokenized)
+
+
 class DatasetActor(Actor):
     """Load preprocessed RL data and provide prompt/target batches."""
 
@@ -99,6 +115,7 @@ class DatasetActor(Actor):
         self._drop_last = False
         self._path: Path | None = None
         self._pad_token_id: int | None = None
+        self._tokenizer: Any | None = None
 
     @endpoint
     def setup(self) -> DatasetActorStatus:
@@ -132,13 +149,14 @@ class DatasetActor(Actor):
         self._shuffle = bool(dataset_config.get("shuffle", self.dataset_name == "train"))
         self._drop_last = bool(dataset_config.get("drop_last", False))
         self._path = path
-        self._pad_token_id = self._load_pad_token_id(config)
+        self._tokenizer = self._load_tokenizer(config)
+        self._pad_token_id = self._resolve_pad_token_id(self._tokenizer)
         self._reset_order()
         logger.info("Loaded %d %s rows from %s.", len(self._rows), self.dataset_name, path)
         return self._status()
 
     @staticmethod
-    def _load_pad_token_id(config: Mapping[str, Any]) -> int:
+    def _load_tokenizer(config: Mapping[str, Any]) -> Any:
         train_actor = _mapping(config.get("train_actor"), "train_actor")
         model = _mapping(train_actor.get("model"), "train_actor.model")
         tokenizer_path = model.get("tokenizer_path") or model.get("model_path")
@@ -149,7 +167,10 @@ class DatasetActor(Actor):
 
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
+        return AutoTokenizer.from_pretrained(str(tokenizer_path))
+
+    @staticmethod
+    def _resolve_pad_token_id(tokenizer: Any) -> int:
         pad_token_id = tokenizer.pad_token_id
         if pad_token_id is None:
             pad_token_id = tokenizer.eos_token_id
@@ -220,6 +241,23 @@ class DatasetActor(Actor):
         if self._pad_token_id is None:
             raise RuntimeError("DatasetActor.setup() must complete first.")
         return self._pad_token_id
+
+    @endpoint
+    def count_tokens(
+        self, messages_batch: Sequence[Sequence[Mapping[str, str]]]
+    ) -> list[int]:
+        if self._tokenizer is None:
+            raise RuntimeError("DatasetActor.setup() must complete first.")
+
+        counts = []
+        for messages in messages_batch:
+            token_ids = self._tokenizer.apply_chat_template(
+                [dict(message) for message in messages],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            counts.append(_tokenized_length(token_ids))
+        return counts
 
     def _status(self) -> DatasetActorStatus:
         return DatasetActorStatus(

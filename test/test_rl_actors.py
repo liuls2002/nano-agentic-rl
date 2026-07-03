@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,7 +19,13 @@ from monarch.actor import shutdown_context, this_host
 
 from actor.dataset_actor import DatasetActor
 from actor.replay_buffer_actor import ReplayBufferActor
-from actor.reward_advantage_actor import AdvantageActor, RewardActor
+from actor.reward_advantage_actor import (
+    AdvantageActor,
+    RewardActor,
+    answers_match,
+    extract_answer,
+    extract_target_answer,
+)
 from actor.rollout_actor import RolloutActor
 from rl.loss import grpo_loss
 from rl.types import RLEpisode
@@ -65,10 +72,26 @@ def test_eval_metrics() -> None:
         [1, 1, 1, 1],
     ]
     metrics = compute_pass_at_k(groups, 2)
-    assert metrics.pass_at_k == 2 / 3
-    assert metrics.g_pass_at_k == 0.5
-    assert metrics.all_pass_at_k == 1 / 3
-    assert [metric.k for metric in compute_pass_at_k_range(groups, 4)] == [1, 2, 3, 4]
+    assert abs(metrics.pass_at_k - 11 / 18) < 1e-12
+    assert [metric.k for metric in compute_pass_at_k_range(groups, 4)] == [1, 2, 4]
+
+
+def test_reward_answer_matching() -> None:
+    tolerance = Decimal("1e-6")
+    assert extract_answer("<answer>0.5</answer>") == "0.5"
+    assert extract_answer("final: \\boxed{\\frac{1}{2}}") is None
+    assert extract_answer("Answer: 1/2") is None
+    assert extract_target_answer("final: \\boxed{\\frac{1}{2}}") == "\\frac{1}{2}"
+    assert extract_target_answer("Answer: 1/2") == "1/2"
+    assert answers_match("\\frac{1}{2}", "0.5", tolerance)
+    assert answers_match("2^3", "8", tolerance)
+    assert answers_match("1,024", "1024", tolerance)
+
+    reward_actor = RewardActor("config")
+    reward_actor._initialized = True
+    assert reward_actor._evaluate("<answer>0.5</answer>", "1/2").reward == 1.0
+    assert reward_actor._evaluate("\\boxed{0.5}", "1/2").reward == 0.0
+    assert reward_actor._evaluate("Answer: 0.5", "1/2").reward == 0.0
 
 
 async def test_nccl_receive_protocol(config_path: Path) -> None:
@@ -218,9 +241,16 @@ def replay_expectations(config_path: Path) -> tuple[int, int, int, int]:
         config = yaml.safe_load(config_file) or {}
     rl_config = config["rl"]
     train_actor = config["train_actor"]
+    train_config = train_actor["train"]
     sequence = config.get("monarch", {}).get("sequence", {})
-    batch_size_per_rank = int(rl_config["replay_buffer"]["batch_size_per_rank"])
+    _ = rl_config["replay_buffer"]
     data_parallel_size = int(train_actor["num_gpus"])
+    global_batch_size = int(train_config["global_batch_size"])
+    if global_batch_size % data_parallel_size:
+        raise AssertionError(
+            "global_batch_size must be divisible by train_actor.num_gpus"
+        )
+    batch_size_per_rank = global_batch_size // data_parallel_size
     prompt_length = int(sequence.get("max_prompt_tokens", 1024))
     response_length = int(sequence.get("max_response_tokens", 1024))
     return batch_size_per_rank, data_parallel_size, prompt_length, response_length
@@ -229,6 +259,7 @@ def replay_expectations(config_path: Path) -> tuple[int, int, int, int]:
 async def run_test(config_path: Path) -> None:
     test_grpo_loss()
     test_eval_metrics()
+    test_reward_answer_matching()
     await test_nccl_receive_protocol(config_path)
     await test_expanded_sampling(config_path)
     host = this_host()
@@ -329,6 +360,7 @@ def run_local_test(config_path: Path) -> None:
     """Run the same component checks in-process for restricted environments."""
     test_grpo_loss()
     test_eval_metrics()
+    test_reward_answer_matching()
     asyncio.run(test_nccl_receive_protocol(config_path))
     asyncio.run(test_expanded_sampling(config_path))
     dataset = DatasetActor(str(config_path.resolve()), "train")
