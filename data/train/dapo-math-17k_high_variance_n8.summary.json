@@ -1,0 +1,17 @@
+{
+  "source_data": "data/train/dapo-math-17k.jsonl",
+  "source_stats": "outputs/rollout_stats/train_rollout_n8.json",
+  "output_data": "data/train/dapo-math-17k_high_variance_n8.jsonl",
+  "criterion": "low_variance == false (std >= 1e-3 in rollout stats)",
+  "num_source_rows": 17398,
+  "num_selected_rows": 4152,
+  "correct_count_histogram": {
+    "1": 1329,
+    "2": 823,
+    "3": 496,
+    "4": 407,
+    "5": 364,
+    "6": 335,
+    "7": 398
+  }
+}

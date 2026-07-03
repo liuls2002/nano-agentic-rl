@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 from dataset_utils import (
@@ -18,16 +19,32 @@ from dataset_utils import (
 
 MATH_PROMPT_TEMPLATE = (
     "Solve the following math problem step by step. The last line of your response "
-    "should be of the form Answer: \\boxed{{$Answer}} where $Answer is the answer "
-    'to the problem.\n\n{question}\n\nRemember to put your answer on its own line after "Answer:".'
+    "should be of the form <answer>$Answer</answer> where $Answer is the answer "
+    "to the problem.\n\n{question}\n\nPut only the final answer inside the "
+    "<answer></answer> tags on the last line."
+)
+
+OLD_BOXED_PREFIX = (
+    "Solve the following math problem step by step. The last line of your response "
+    "should be of the form Answer: \\boxed{$Answer} where $Answer is the answer "
+    "to the problem."
+)
+OLD_ANSWER_SUFFIX = re.compile(
+    r'\n\nRemember to put your answer on its own line after "Answer:"\.\s*$'
 )
 
 
-def build_record(question: str, label: str, *, add_math_template: bool) -> dict[str, object]:
-    user_content = (
-        MATH_PROMPT_TEMPLATE.format(question=question.strip())
-        if add_math_template
-        else question.strip()
+def normalize_question(question: str) -> str:
+    text = question.strip()
+    if text.startswith(OLD_BOXED_PREFIX) and "\n\n" in text:
+        text = text.split("\n\n", 1)[1].strip()
+    text = OLD_ANSWER_SUFFIX.sub("", text).strip()
+    return text
+
+
+def build_record(question: str, label: str) -> dict[str, object]:
+    user_content = MATH_PROMPT_TEMPLATE.format(
+        question=normalize_question(question)
     )
     return {
         "messages": [
@@ -35,15 +52,14 @@ def build_record(question: str, label: str, *, add_math_template: bool) -> dict[
             message("user", user_content, 0),
         ],
         "label": label,
-    }
+}
 
 
-def convert_file(source: Path, destination: Path, *, add_math_template: bool) -> int:
+def convert_file(source: Path, destination: Path) -> int:
     records = [
         build_record(
             question=extract_problem(row, source),
             label=extract_label(row, source),
-            add_math_template=add_math_template,
         )
         for row in read_records(source)
     ]
@@ -67,32 +83,24 @@ def main() -> None:
         (
             args.raw_root / "train" / "dapo-math-17k.jsonl",
             args.train_root / "dapo-math-17k.jsonl",
-            False,
         ),
         (
             args.raw_root / "val" / "aime-2024.jsonl",
             args.val_root / "aime-2024.jsonl",
-            True,
         ),
         (
             args.raw_root / "val" / "aime-2025.jsonl",
             args.val_root / "aime-2025.jsonl",
-            True,
         ),
     ]
-    for source, destination, add_math_template in conversions:
+    for source, destination in conversions:
         source = source.expanduser().resolve()
         destination = destination.expanduser().resolve()
         if not source.is_file():
             raise FileNotFoundError(source)
-        count = convert_file(
-            source,
-            destination,
-            add_math_template=add_math_template,
-        )
+        count = convert_file(source, destination)
         print(f"{source} -> {destination} ({count} samples)")
 
 
 if __name__ == "__main__":
     main()
-

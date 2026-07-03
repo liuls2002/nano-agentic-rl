@@ -313,12 +313,14 @@ class RolloutActor(Actor):
             )
         return next_version
 
-    async def _generate_one(self, prompt: Any, sampling_params: Any) -> Any:
+    async def _generate_one(
+        self, prompt: Any, sampling_params: Any, request_id: str | None = None
+    ) -> Any:
         request_output = None
         async for output in self._require_llm().generate(
             prompt=prompt,
             sampling_params=sampling_params,
-            request_id=str(uuid.uuid4()),
+            request_id=request_id or str(uuid.uuid4()),
         ):
             request_output = output
         if request_output is None:
@@ -326,12 +328,23 @@ class RolloutActor(Actor):
         return request_output
 
     async def _generate_expanded(
-        self, prompt: Any, sampling_params: Any, policy_version: int
+        self,
+        prompt: Any,
+        sampling_params: Any,
+        policy_version: int,
+        group_id: str,
     ) -> RolloutOutput:
         single_params, requested_n = self._make_single_sample_params(sampling_params)
-        request_outputs = []
-        for _ in range(requested_n):
-            request_outputs.append(await self._generate_one(prompt, single_params))
+        request_outputs = await asyncio.gather(
+            *(
+                self._generate_one(
+                    prompt,
+                    single_params.clone() if requested_n > 1 else single_params,
+                    request_id=f"{group_id}-sample-{sample_index}-{uuid.uuid4().hex}",
+                )
+                for sample_index in range(requested_n)
+            )
+        )
 
         converted_outputs = [
             _convert_request_output(output, policy_version)
@@ -456,9 +469,12 @@ class RolloutActor(Actor):
             outputs = await asyncio.gather(
                 *(
                     self._generate_expanded(
-                        prompt, resolved_sampling_params, policy_version
+                        prompt,
+                        resolved_sampling_params,
+                        policy_version,
+                        group_id=f"completion-{prompt_index}",
                     )
-                    for prompt in engine_prompts
+                    for prompt_index, prompt in enumerate(engine_prompts)
                 )
             )
             logger.info(
@@ -504,9 +520,12 @@ class RolloutActor(Actor):
             return await asyncio.gather(
                 *(
                     self._generate_expanded(
-                        prompt, resolved_sampling_params, policy_version
+                        prompt,
+                        resolved_sampling_params,
+                        policy_version,
+                        group_id=f"chat-{prompt_index}",
                     )
-                    for prompt in engine_prompts
+                    for prompt_index, prompt in enumerate(engine_prompts)
                 )
             )
 

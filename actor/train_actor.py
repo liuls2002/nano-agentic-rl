@@ -78,6 +78,7 @@ def load_veomni_args(config_path: str) -> VeOmniArguments:
         "train_path": str(train_path),
         "datasets_type": train_loader.get("datasets_type", "mapping"),
         "data_type": train_loader.get("data_type", "conversation"),
+        "chat_template": train_loader.get("chat_template", "default"),
         "text_keys": train_loader.get("text_keys", "messages"),
         "max_seq_len": int(train_loader.get("max_seq_len", 2048)),
         "dataloader": {

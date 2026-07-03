@@ -1,0 +1,16 @@
+{"db_id":"company","question":"How many employees work in the Engineering department?","query":"SELECT COUNT(*) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.name = 'Engineering'"}
+{"db_id":"company","question":"List the names of employees in Research ordered alphabetically.","query":"SELECT e.name FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.name = 'Research' ORDER BY e.name"}
+{"db_id":"company","question":"Which department has the highest average employee salary?","query":"SELECT d.name FROM departments d JOIN employees e ON d.id = e.department_id GROUP BY d.id, d.name ORDER BY AVG(e.salary) DESC LIMIT 1"}
+{"db_id":"company","question":"What is the total budget of active projects?","query":"SELECT SUM(budget) FROM projects WHERE status = 'active'"}
+{"db_id":"company","question":"List project names with budgets greater than 600000, from highest budget to lowest.","query":"SELECT name FROM projects WHERE budget > 600000 ORDER BY budget DESC"}
+{"db_id":"company","question":"How many employees were hired in or after 2021?","query":"SELECT COUNT(*) FROM employees WHERE hire_year >= 2021"}
+{"db_id":"company","question":"What is the name and salary of the highest paid employee?","query":"SELECT name, salary FROM employees ORDER BY salary DESC LIMIT 1"}
+{"db_id":"company","question":"Which cities have more than one department?","query":"SELECT city FROM departments GROUP BY city HAVING COUNT(*) > 1 ORDER BY city"}
+{"db_id":"company","question":"Give the number of employees in each department, ordered by department name.","query":"SELECT d.name, COUNT(e.id) FROM departments d LEFT JOIN employees e ON d.id = e.department_id GROUP BY d.id, d.name ORDER BY d.name"}
+{"db_id":"company","question":"List employees who earn more than 100000 and were hired before 2021, ordered by salary descending.","query":"SELECT name FROM employees WHERE salary > 100000 AND hire_year < 2021 ORDER BY salary DESC"}
+{"db_id":"company","question":"What is the average salary in the Finance department?","query":"SELECT AVG(e.salary) FROM employees e JOIN departments d ON e.department_id = d.id WHERE d.name = 'Finance'"}
+{"db_id":"company","question":"Which departments have at least one planned project?","query":"SELECT DISTINCT d.name FROM departments d JOIN projects p ON d.id = p.department_id WHERE p.status = 'planned' ORDER BY d.name"}
+{"db_id":"company","question":"How many projects belong to departments located in Beijing?","query":"SELECT COUNT(*) FROM projects p JOIN departments d ON p.department_id = d.id WHERE d.city = 'Beijing'"}
+{"db_id":"company","question":"List department names and their total project budgets, highest total first.","query":"SELECT d.name, SUM(p.budget) AS total_budget FROM departments d JOIN projects p ON d.id = p.department_id GROUP BY d.id, d.name ORDER BY total_budget DESC"}
+{"db_id":"company","question":"Which employee was hired most recently?","query":"SELECT name FROM employees ORDER BY hire_year DESC, id ASC LIMIT 1"}
+{"db_id":"company","question":"List departments whose average salary is above 100000, ordered by name.","query":"SELECT d.name FROM departments d JOIN employees e ON d.id = e.department_id GROUP BY d.id, d.name HAVING AVG(e.salary) > 100000 ORDER BY d.name"}

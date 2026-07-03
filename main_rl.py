@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import os
 import socket
 import uuid
@@ -29,7 +30,7 @@ from tools.eval_metrics import compute_pass_at_k_range
 
 
 logger = logging.getLogger("main_rl")
-DEFAULT_CONFIG = Path(__file__).parent / "config" / "qwen2_5_1_5b_gsm8k.yaml"
+DEFAULT_CONFIG = Path(__file__).parent / "config" / "qwen2_5_1_5b_gsm8k_grpo.yaml"
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 
 
@@ -60,6 +61,33 @@ def _positive_int(value: Any, name: str) -> int:
     if result <= 0:
         raise ValueError(f"{name} must be positive.")
     return result
+
+
+def split_worker_gpus(
+    train_num_gpus: int, rollout_num_gpus: int
+) -> tuple[list[str], list[str]]:
+    required_gpus = train_num_gpus + rollout_num_gpus
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible_devices:
+        gpu_pool = [
+            device.strip()
+            for device in visible_devices.split(",")
+            if device.strip()
+        ]
+    else:
+        gpu_pool = [str(gpu_id) for gpu_id in range(required_gpus)]
+
+    if len(gpu_pool) < required_gpus:
+        raise ValueError(
+            "Not enough visible GPUs for train_actor.num_gpus + "
+            f"rollout_actor.num_gpus ({required_gpus} required, "
+            f"{len(gpu_pool)} visible from CUDA_VISIBLE_DEVICES="
+            f"{visible_devices!r})."
+        )
+    return (
+        gpu_pool[:train_num_gpus],
+        gpu_pool[train_num_gpus:required_gpus],
+    )
 
 
 def summarize_train_results(train_results: Mapping[Any, Any]) -> dict[str, float]:
@@ -109,8 +137,7 @@ def validate_rl_config(config: Mapping[str, Any]) -> dict[str, Any]:
     rollout_num_gpus = _positive_int(
         rollout_actor.get("num_gpus", 0), "rollout_actor.num_gpus"
     )
-    train_gpus = list(range(train_num_gpus))
-    rollout_gpus = list(range(train_num_gpus, train_num_gpus + rollout_num_gpus))
+    train_gpus, rollout_gpus = split_worker_gpus(train_num_gpus, rollout_num_gpus)
 
     for name, data_config in (
         ("dataloader.train", train_data),
@@ -154,9 +181,14 @@ def validate_rl_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if max_steps <= 0:
         raise ValueError("rl.max_steps must be positive.")
     rollout_batch_size = int(rl_config.get("rollout_batch_size", 1))
+    rollout_batch_size_multiplier = float(
+        rl_config.get("rollout_batch_size_multiplier", 1.0)
+    )
     max_rollout_groups = int(rl_config.get("max_rollout_groups_per_step", 16))
     if rollout_batch_size <= 0 or max_rollout_groups <= 0:
         raise ValueError("RL rollout batch size and group limit must be positive.")
+    if rollout_batch_size_multiplier <= 0:
+        raise ValueError("rl.rollout_batch_size_multiplier must be positive.")
     replay = _mapping(rl_config.get("replay_buffer"), "rl.replay_buffer")
     batch_size_per_rank = int(replay.get("batch_size_per_rank", 1))
     expected_global_batch = batch_size_per_rank * train_num_gpus
@@ -206,7 +238,10 @@ def validate_rl_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "shutdown_timeout": shutdown_timeout,
         "max_steps": max_steps,
         "rollout_batch_size": rollout_batch_size,
+        "rollout_batch_size_multiplier": rollout_batch_size_multiplier,
         "max_rollout_groups_per_step": max_rollout_groups,
+        "train_batch_episode_count": expected_global_batch,
+        "samples_per_prompt": samples_per_prompt,
         "drop_low_variance_groups": bool(
             rl_config.get("drop_low_variance_groups", False)
         ),
@@ -276,7 +311,10 @@ async def fill_replay_buffer(
     rollout_actor: Any,
     current_policy_version: int,
     rollout_batch_size: int,
+    rollout_batch_size_multiplier: float,
     max_groups: int,
+    train_batch_episode_count: int,
+    samples_per_prompt: int,
     drop_low_variance: bool,
 ) -> list[dict[str, Any]]:
     groups_processed = 0
@@ -285,7 +323,34 @@ async def fill_replay_buffer(
         if batch is not None:
             return batch
 
-        dataset_samples = await dataset.next_batch.call_one(rollout_batch_size)
+        status = await replay_buffer.get_status.call_one()
+        groups_remaining = max_groups - groups_processed
+        if groups_processed == 0:
+            target_groups = rollout_batch_size
+        else:
+            missing_episodes = max(
+                train_batch_episode_count - int(status.size), 0
+            )
+            target_groups = max(
+                1, math.ceil(missing_episodes / samples_per_prompt)
+            )
+        planned_groups = min(
+            groups_remaining,
+            max(1, math.ceil(target_groups * rollout_batch_size_multiplier)),
+        )
+        logger.info(
+            "Requesting %d rollout group(s): target=%d, multiplier=%.2f, "
+            "buffer=%d/%d, processed=%d/%d.",
+            planned_groups,
+            target_groups,
+            rollout_batch_size_multiplier,
+            status.size,
+            train_batch_episode_count,
+            groups_processed,
+            max_groups,
+        )
+
+        dataset_samples = await dataset.next_batch.call_one(planned_groups)
         rollout_outputs = await rollout_actor.chat.call_one(
             [sample.messages for sample in dataset_samples]
         )
@@ -583,7 +648,12 @@ async def run_rl(config_path: Path) -> None:
                 rollout_actor=rollout_actor,
                 current_policy_version=policy_version,
                 rollout_batch_size=settings["rollout_batch_size"],
+                rollout_batch_size_multiplier=settings[
+                    "rollout_batch_size_multiplier"
+                ],
                 max_groups=settings["max_rollout_groups_per_step"],
+                train_batch_episode_count=settings["train_batch_episode_count"],
+                samples_per_prompt=settings["samples_per_prompt"],
                 drop_low_variance=settings["drop_low_variance_groups"],
             )
             train_results = await train_actors.train_grpo_step.call(batches)

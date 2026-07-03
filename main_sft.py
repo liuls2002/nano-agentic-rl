@@ -53,6 +53,33 @@ def _positive_int(value: Any, name: str) -> int:
     return result
 
 
+def split_worker_gpus(
+    train_num_gpus: int, rollout_num_gpus: int
+) -> tuple[list[str], list[str]]:
+    required_gpus = train_num_gpus + rollout_num_gpus
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible_devices:
+        gpu_pool = [
+            device.strip()
+            for device in visible_devices.split(",")
+            if device.strip()
+        ]
+    else:
+        gpu_pool = [str(gpu_id) for gpu_id in range(required_gpus)]
+
+    if len(gpu_pool) < required_gpus:
+        raise ValueError(
+            "Not enough visible GPUs for train_actor.num_gpus + "
+            f"rollout_actor.num_gpus ({required_gpus} required, "
+            f"{len(gpu_pool)} visible from CUDA_VISIBLE_DEVICES="
+            f"{visible_devices!r})."
+        )
+    return (
+        gpu_pool[:train_num_gpus],
+        gpu_pool[train_num_gpus:required_gpus],
+    )
+
+
 def validate_sft_config(config: Mapping[str, Any]) -> dict[str, Any]:
     monarch = _mapping(config.get("monarch"), "monarch")
     train_actor = _mapping(config.get("train_actor"), "train_actor")
@@ -71,8 +98,7 @@ def validate_sft_config(config: Mapping[str, Any]) -> dict[str, Any]:
     rollout_num_gpus = _positive_int(
         rollout_actor.get("num_gpus", 0), "rollout_actor.num_gpus"
     )
-    train_gpus = list(range(train_num_gpus))
-    rollout_gpus = list(range(train_num_gpus, train_num_gpus + rollout_num_gpus))
+    train_gpus, rollout_gpus = split_worker_gpus(train_num_gpus, rollout_num_gpus)
 
     for name, data_config in (
         ("dataloader.train", train_data),

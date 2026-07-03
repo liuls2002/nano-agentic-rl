@@ -3,56 +3,67 @@ monarch:
   env:
     # CUDA 13.0 machine has no IB device. All Monarch workers inherit this.
     NCCL_IB_DISABLE: "1"
+
+
+rl:
+  # Controller-level GRPO settings. main_rl.py performs one rollout/train/sync cycle per step; SFT ignores this section.
+  max_steps: 1000
+  weight_sync:
+    # Trainer rank 0 broadcasts FSDP-gathered parameters directly to all vLLM workers.
+    backend: nccl
+    packed: true
+    packed_buffer_size_bytes: 536870912 # 512 MiB
+    packed_num_buffers: 2
+  rollout_batch_size: 4
+  rollout_batch_size_multiplier: 2.0
+  max_rollout_groups_per_step: 128
+  max_prompt_tokens: 1024
+  max_response_tokens: 1024
+  clip_low: 0.2
+  clip_high: 0.28
+  drop_low_variance_groups: true
+  mask_truncated_responses: false
+  reward:
+    correctness_weight: 1.0
+    format_weight: 0.0
+    tolerance: 1.0e-6
+  advantage:
+    epsilon: 1.0e-4
+    minimum_group_std: 1.0e-3
+  replay_buffer:
+    # Four samples on each of two VeOmni ranks consume one 8-sample GRPO group.
+    batch_size_per_rank: 8
+    capacity: 256
+    max_policy_age: 0
+    consume_samples: true
+    seed: 42
+
+
+dataloader:
   train:
-    # One VeOmni rank is created for each visible training GPU.
-    gpu_ids: [0, 1]
-  rollout:
-    # vLLM consumes DP x TP x PP GPUs from this visible-device list.
-    gpu_ids: [2, 3]
-  rl:
-    # Controller-level GRPO settings. main_rl.py performs one rollout/train/sync
-    # cycle per step; SFT ignores this section.
-    max_steps: 1000
-    weight_sync:
-      # Trainer rank 0 broadcasts FSDP-gathered parameters directly to all
-      # vLLM workers. No checkpoint is written on the rollout hot path.
-      backend: nccl
-      packed: true
-      packed_buffer_size_bytes: 268435456 # 256 MiB
-      packed_num_buffers: 2
-    rollout_batch_size: 2
-    max_rollout_groups_per_step: 32
-    max_prompt_tokens: 512
-    max_response_tokens: 256
-    clip_low: 0.2
-    clip_high: 0.28
-    drop_low_variance_groups: true
-    mask_truncated_responses: false
-    reward:
-      correctness_weight: 1.0
-      format_weight: 0.0
-      tolerance: 1.0e-6
-    advantage:
-      epsilon: 1.0e-4
-      minimum_group_std: 1.0e-3
-    replay_buffer:
-      # Four samples on each of two VeOmni ranks consume one 8-sample GRPO group.
-      batch_size_per_rank: 8
-      capacity: 256
-      max_policy_age: 0
-      consume_samples: true
-      seed: 42
+    type: native
+    path: /ssd/liuls/projects/hw/nano-agentic-rl/data/train/dapo-math-17k_high_variance_n8.jsonl
+    max_samples: -1   # -1表示取全部
+    datasets_type: mapping
+    data_type: conversation
+    chat_template: chatml
+    text_keys: messages
+    max_seq_len: 2048
+    drop_last: true
+    pin_memory: true
+    shuffle: true
+  eval:
+    path: /ssd/liuls/projects/hw/nano-agentic-rl/data/val/aime-2024.jsonl
+    max_samples: -1
+    shuffle: false
 
-veomni:
-  data_adapter:
-    type: prompt_response
-    prompt_key: question
-    response_key: answer
-    system_prompt: Solve the math problem step by step and give the final answer.
 
+train_actor:
+  backend: veomni
+  num_gpus: 4
   model:
-    model_path: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
-    tokenizer_path: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
+    model_path: /ssd/liuls/data/hub/Qwen3-4B-Instruct-2507
+    tokenizer_path: /ssd/liuls/data/hub/Qwen3-4B-Instruct-2507
     ops_implementation:
       attn_implementation: sdpa
       moe_implementation: eager
@@ -64,25 +75,13 @@ veomni:
       rms_norm_gated_implementation: eager
       causal_conv1d_implementation: eager
       chunk_gated_delta_rule_implementation: eager
-
-  data:
-    train_path: /ssd/liuls/data/hub/gsm8k/train.parquet
-    datasets_type: mapping
-    data_type: conversation
-    # Training sequence contains at most 512 prompt + 256 response tokens.
-    max_seq_len: 768
-    dataloader:
-      type: native
-      num_workers: 0
-      drop_last: true
-      pin_memory: true
-
+  
   train:
     dyn_bsz: false
     micro_batch_size: 1
-    global_batch_size: 16
+    global_batch_size: 32
     num_train_epochs: 1
-    max_steps: 100
+    max_steps: 1000
     init_device: meta
     seed: 42
     accelerator:
@@ -93,17 +92,17 @@ veomni:
       offload_config:
         enable_activation: false
     gradient_checkpointing:
-      enable: false
+      enable: true
     optimizer:
       type: adamw
-      lr: 2.0e-5
+      lr: 1.0e-6
       lr_warmup_ratio: 0.0
       lr_decay_style: constant
       lr_decay_ratio: 1.0
-      weight_decay: 0.0
+      weight_decay: 0.1
       max_grad_norm: 1.0
     checkpoint:
-      output_dir: outputs/qwen2_5_1_5b_gsm8k_sft
+      output_dir: outputs/exp_grpo
       save_steps: 0
       save_epochs: 0
       hf_save_steps: 0
@@ -112,29 +111,47 @@ veomni:
     wandb:
       enable: false
 
-vllm:
+
+rollout_actor:
+  backend: vllm
+  num_gpus: 2
+  colocate: False
+  
   initial_policy_version: 0
   engine:
-    # Internal vLLM DP: each rank owns one full model replica.
     data_parallel_size: 2
     data_parallel_backend: mp
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
-    model: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
-    tokenizer: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
+    model: /ssd/liuls/data/hub/Qwen3-4B-Instruct-2507  # 模型应该从trainer在线更新过来
+    tokenizer: /ssd/liuls/data/hub/Qwen3-4B-Instruct-2507
+    load_format: dummy
     dtype: bfloat16
-    # Exact rollout context budget: 512 prompt + 256 generated tokens.
-    max_model_len: 768
+    max_model_len: 2048
     gpu_memory_utilization: 0.8
-    enforce_eager: true # close torch.compile and CUDA graph
+    enforce_eager: true
     # Enable vLLM's native NCCL receiver used by main_rl.py.
     weight_transfer_config:
       backend: nccl
     seed: 42
-  sampling:
-    # Number of responses per prompt; this becomes the GRPO group size.
-    n: 8
-    max_tokens: 256
-    temperature: 1.0
-    top_p: 0.95
-    logprobs: 1
+  
+  rollout: 
+    max_prompt_tokens: 1024
+    max_response_tokens: 1024
+    sampling:
+      n: 8    # grpo
+      max_tokens: 1024
+      temperature: 1.0
+      top_p: 0.95
+      logprobs: 1
+  
+  eval:
+    eval_steps: 20
+    eval_epochs: 1
+    batch_size: 2048
+    sampling:
+      n: 8    # 每个样本采样n次回答，统计pass@k，g-pass@k指标
+      max_tokens: 1024
+      temperature: 0.7
+      top_p: 0.95
+      logprobs: 0
