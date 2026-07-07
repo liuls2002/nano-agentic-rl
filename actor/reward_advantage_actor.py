@@ -111,24 +111,45 @@ def _as_decimal(text: str | None) -> Decimal | None:
     if text is None:
         return None
     text = _clean_answer_text(text)
+
+    def safe_decimal(value: str) -> Decimal | None:
+        try:
+            number = Decimal(value)
+            if not number.is_finite():
+                return None
+            return number
+        except (InvalidOperation, ValueError, TypeError, AttributeError):
+            return None
+
     latex_fraction = LATEX_FRAC_PATTERN.fullmatch(text)
     if latex_fraction:
         try:
-            return Decimal(latex_fraction.group(1)) / Decimal(latex_fraction.group(2))
-        except (InvalidOperation, DivisionByZero):
+            numerator = safe_decimal(latex_fraction.group(1))
+            denominator = safe_decimal(latex_fraction.group(2))
+            if numerator is None or denominator is None:
+                return None
+            number = numerator / denominator
+            if not number.is_finite():
+                return None
+            return number
+        except (InvalidOperation, DivisionByZero, ZeroDivisionError):
             return None
 
     plain_fraction = PLAIN_FRAC_PATTERN.fullmatch(text)
     if plain_fraction:
         try:
-            return Decimal(plain_fraction.group(1)) / Decimal(plain_fraction.group(2))
-        except (InvalidOperation, DivisionByZero):
+            numerator = safe_decimal(plain_fraction.group(1))
+            denominator = safe_decimal(plain_fraction.group(2))
+            if numerator is None or denominator is None:
+                return None
+            number = numerator / denominator
+            if not number.is_finite():
+                return None
+            return number
+        except (InvalidOperation, DivisionByZero, ZeroDivisionError):
             return None
 
-    try:
-        return Decimal(text)
-    except (InvalidOperation, AttributeError):
-        return None
+    return safe_decimal(text)
 
 
 def _clean_answer_text(text: str) -> str:
@@ -177,7 +198,10 @@ def answers_match(predicted: str | None, target: str | None, tolerance: Decimal)
     predicted_number = _as_decimal(predicted)
     target_number = _as_decimal(target)
     if predicted_number is not None and target_number is not None:
-        return abs(predicted_number - target_number) <= tolerance
+        try:
+            return abs(predicted_number - target_number) <= tolerance
+        except (InvalidOperation, ValueError, TypeError, AttributeError):
+            return False
 
     predicted_normalized = _normalize_answer(predicted)
     target_normalized = _normalize_answer(target)

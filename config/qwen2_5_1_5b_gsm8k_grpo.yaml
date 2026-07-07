@@ -4,15 +4,15 @@ monarch:
     # CUDA 13.0 machine has no IB device. All Monarch workers inherit this.
     NCCL_IB_DISABLE: "1"
   sequence:
-    max_prompt_tokens: 1024
+    max_prompt_tokens: 2048
     max_response_tokens: 2048
   wandb:
     enable: true
     project: nano-agentic-rl
-    name: qwen2_5_1_5b_grpo
+    name: qwen3_1_7b_grpo
     # entity: your_wandb_entity      # 可选
     group: grpo-dapo               # 可选
-    tags: ["qwen2.5-1.5b", "grpo", "dapo-17k"]  # 可选
+    tags: ["qwen3-1.7b", "grpo", "gsm8k"]  # 可选
     mode: online                   # 可选，也可以 offline / disabled
     dir: outputs/wandb             # 可选
     gpu_sample_interval_seconds: 1.0
@@ -39,7 +39,7 @@ rl:
     filter_overlong_responses: false
   reward:
     correctness_weight: 1.0
-    format_weight: 0.1
+    format_weight: 0.0
     tolerance: 1.0e-6
   advantage:
     epsilon: 1.0e-6
@@ -55,7 +55,7 @@ rl:
 dataloader:
   train:
     type: native
-    path: /ssd/liuls/projects/hw/nano-agentic-rl/data/train/dapo-math-17k.jsonl
+    path: /ssd/liuls/projects/hw/nano-agentic-rl/data/train/gsm8k_train.jsonl
     max_samples: -1   # -1表示取全部
     datasets_type: mapping
     data_type: conversation
@@ -65,7 +65,7 @@ dataloader:
     pin_memory: true
     shuffle: true
   eval:
-    path: /ssd/liuls/projects/hw/nano-agentic-rl/data/val/aime-2024.jsonl
+    path: /ssd/liuls/projects/hw/nano-agentic-rl/data/val/gsm8k_val.jsonl
     max_samples: -1
     shuffle: false
 
@@ -74,8 +74,8 @@ train_actor:
   backend: veomni
   num_gpus: 4
   model:
-    model_path: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
-    tokenizer_path: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
+    model_path: /ssd/liuls/data/hub/Qwen3-1.7B-Base
+    tokenizer_path: /ssd/liuls/data/hub/Qwen3-1.7B-Base
     ops_implementation:
       attn_implementation: sdpa
       moe_implementation: eager
@@ -92,7 +92,7 @@ train_actor:
     dyn_bsz: false
     micro_batch_size: 1
     global_batch_size: 32
-    num_train_epochs: 1
+    num_train_epochs: 10
     max_steps: 1000
     init_device: meta
     seed: 42
@@ -135,8 +135,8 @@ rollout_actor:
     data_parallel_backend: mp
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
-    model: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct  # 模型应该从trainer在线更新过来
-    tokenizer: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
+    model: /ssd/liuls/data/hub/Qwen3-1.7B-Base  # 模型应该从trainer在线更新过来
+    tokenizer: /ssd/liuls/data/hub/Qwen3-1.7B-Base
     load_format: dummy
     dtype: bfloat16
     gpu_memory_utilization: 0.8
@@ -158,7 +158,7 @@ rollout_actor:
     eval_epochs: 1
     batch_size: 2048
     sampling:
-      n: 8   # 每个样本采样n次回答，统计pass@k，g-pass@k指标
-      temperature: 1.0
+      n: 1   # 每个样本采样n次回答，统计pass@k指标
+      temperature: 0.7
       top_p: 0.95
       logprobs: 0

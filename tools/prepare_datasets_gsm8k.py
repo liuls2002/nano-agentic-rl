@@ -17,7 +17,10 @@ from dataset_utils import (
 )
 
 
-GSM8K_ANSWER_INSTRUCTION = 'Let\'s think step by step and output the final answer after "####".'
+GSM8K_ANSWER_INSTRUCTION = (
+    "Let's think step by step and output the final answer inside "
+    "<answer>...</answer>."
+)
 
 
 def extract_answer(row: dict[str, Any], path: Path) -> str:
@@ -26,12 +29,19 @@ def extract_answer(row: dict[str, Any], path: Path) -> str:
     return str(row["answer"]).strip()
 
 
+def format_assistant_answer(answer: str, label: str) -> str:
+    reasoning = answer.rsplit("####", 1)[0].strip() if "####" in answer else answer.strip()
+    if reasoning:
+        return f"{reasoning}\n<answer>{label}</answer>"
+    return f"<answer>{label}</answer>"
+
+
 def build_record(question: str, answer: str, label: str) -> dict[str, Any]:
     return {
         "messages": [
             message("system", SYSTEM_PROMPT, 0),
             message("user", f"{question.strip()} {GSM8K_ANSWER_INSTRUCTION}", 0),
-            message("assistant", answer.strip(), 1),
+            message("assistant", format_assistant_answer(answer, label), 1),
         ],
         "label": label,
     }
@@ -83,4 +93,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

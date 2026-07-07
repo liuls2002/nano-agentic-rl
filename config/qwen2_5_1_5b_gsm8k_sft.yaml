@@ -4,8 +4,8 @@ monarch:
     # CUDA 13.0 machine has no IB device. All Monarch workers inherit this.
     NCCL_IB_DISABLE: "1"
   sequence:
-    max_prompt_tokens: 1024
-    max_response_tokens: 1024
+    max_prompt_tokens: 2048
+    max_response_tokens: 2048
 
 
 # rl:
@@ -63,8 +63,8 @@ train_actor:
   backend: veomni
   num_gpus: 4
   model:
-    model_path: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
-    tokenizer_path: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
+    model_path: /ssd/liuls/data/hub/Qwen3-1.7B-Base
+    tokenizer_path: /ssd/liuls/data/hub/Qwen3-1.7B-Base
     ops_implementation:
       attn_implementation: sdpa
       moe_implementation: eager
@@ -82,7 +82,7 @@ train_actor:
     micro_batch_size: 1
     global_batch_size: 32
     num_train_epochs: 3
-    max_steps: 1000000
+    # max_steps: 1000000
     init_device: meta
     seed: 42
     accelerator:
@@ -97,13 +97,15 @@ train_actor:
     optimizer:
       type: adamw
       lr: 1.0e-5
-      lr_warmup_ratio: 0.0
-      lr_decay_style: constant
+      lr_min: 1.0e-7
+      lr_start: 0.0
+      lr_warmup_ratio: 0.05
+      lr_decay_style: cosine
       lr_decay_ratio: 1.0
       weight_decay: 0.1
       max_grad_norm: 1.0
     checkpoint:
-      output_dir: outputs/qwen2_5_1_5b_gsm8k_sft
+      output_dir: outputs/qwen3_1_7b_gsm8k_sft
       save_steps: 0
       save_epochs: 0
       hf_save_steps: 0
@@ -115,17 +117,17 @@ train_actor:
 
 rollout_actor:
   backend: vllm
-  num_gpus: 4
+  num_gpus: 2
   colocate: False
   
   initial_policy_version: 0
   engine:
-    data_parallel_size: 4
+    data_parallel_size: 2
     data_parallel_backend: mp
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
-    model: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct  # 模型应该从trainer在线更新过来
-    tokenizer: /ssd/liuls/data/hub/Qwen2.5-1.5B-Instruct
+    model: /ssd/liuls/data/hub/Qwen3-1.7B-Base  # 模型应该从trainer在线更新过来
+    tokenizer: /ssd/liuls/data/hub/Qwen3-1.7B-Base
     load_format: dummy
     dtype: bfloat16
     gpu_memory_utilization: 0.8
@@ -147,7 +149,7 @@ rollout_actor:
     eval_epochs: 1
     batch_size: 2048
     sampling:
-      n: 4    # 每个样本采样n次回答，统计pass@k，g-pass@k指标
+      n: 1    # 每个样本采样n次回答，统计pass@k，g-pass@k指标
       temperature: 0.7
       top_p: 0.95
       logprobs: 0
