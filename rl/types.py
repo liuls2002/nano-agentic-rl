@@ -14,6 +14,7 @@ class DatasetSample:
     prompt: str
     target: str
     messages: list[dict[str, str]]
+    teacher_messages: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass

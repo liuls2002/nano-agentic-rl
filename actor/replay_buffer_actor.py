@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import torch
-import yaml
 from monarch.actor import Actor, endpoint
 
+from actor.utils import load_yaml_config
 from rl.types import RLEpisode
 
 
@@ -28,8 +28,7 @@ class ReplayBufferStatus:
 
 
 def _load_settings(config_path: str) -> dict[str, Any]:
-    with open(config_path, encoding="utf-8") as config_file:
-        config = yaml.safe_load(config_file) or {}
+    config = load_yaml_config(config_path)
     monarch_config = config.get("monarch", {})
     rl_config = config.get("rl", {})
     train_actor = config.get("train_actor", {})

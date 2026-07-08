@@ -32,7 +32,7 @@ from rl.types import RLEpisode
 from tools.eval_metrics import compute_pass_at_k, compute_pass_at_k_range
 
 
-DEFAULT_CONFIG = PROJECT_ROOT / "config" / "qwen2_5_1_5b_gsm8k.yaml"
+DEFAULT_CONFIG = PROJECT_ROOT / "config" / "qwen3_1_7b_gsm8k_grpo.yaml"
 
 
 def invoke_local(actor: object, endpoint_name: str, *args: object) -> object:
@@ -59,8 +59,17 @@ def test_grpo_loss() -> None:
         loss_mask=loss_mask,
         advantages=advantages,
     )
+    scaled = grpo_loss(
+        logits=logits,
+        tokens=tokens,
+        generator_logprobs=old_logprobs,
+        loss_mask=loss_mask,
+        advantages=advantages,
+        normalizer=torch.tensor(10.0),
+    )
     assert torch.isfinite(output.loss)
     assert output.metrics["active_tokens"] == 5.0
+    assert torch.allclose(scaled.loss, output.loss * 0.5)
     output.loss.backward()
     assert logits.grad is not None
 
@@ -195,7 +204,9 @@ async def test_expanded_sampling(config_path: Path) -> None:
     rollout.policy_version = 7
     params = rollout._make_sampling_params({"n": 3, "max_tokens": 8})
 
-    output = await rollout._generate_expanded("prompt", params, rollout.policy_version)
+    output = await rollout._generate_expanded(
+        "prompt", params, rollout.policy_version, group_id="test"
+    )
     assert [call[1] for call in rollout.llm.calls] == [1, 1, 1]
     assert output.policy_version == 7
     assert output.prompt_token_ids == [1, 2]
@@ -292,10 +303,15 @@ async def run_test(config_path: Path) -> None:
         for checked_sample in (sample, eval_sample):
             assert checked_sample.prompt and checked_sample.target
             assert checked_sample.messages
+            assert checked_sample.teacher_messages
             assert checked_sample.target
             assert all(
                 message["role"] != "assistant"
                 for message in checked_sample.messages
+            )
+            assert any(
+                message["role"] == "assistant"
+                for message in checked_sample.teacher_messages
             )
 
         await actors["reward"].setup.call_one()
@@ -378,9 +394,14 @@ def run_local_test(config_path: Path) -> None:
     for checked_sample in (sample, eval_sample):
         assert checked_sample.prompt and checked_sample.target
         assert checked_sample.messages
+        assert checked_sample.teacher_messages
         assert all(
             message["role"] != "assistant"
             for message in checked_sample.messages
+        )
+        assert any(
+            message["role"] == "assistant"
+            for message in checked_sample.teacher_messages
         )
 
     invoke_local(reward_actor, "setup")

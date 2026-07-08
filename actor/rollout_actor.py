@@ -11,8 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
 from monarch.actor import Actor, endpoint
+
+from actor.utils import load_yaml_config, mapping
 
 
 logger = logging.getLogger(__name__)
@@ -60,37 +61,24 @@ class RolloutActorStatus:
     model_path: str
 
 
-def _require_mapping(value: Any, name: str) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if not isinstance(value, Mapping):
-        raise TypeError(f"{name} must be a mapping, got {type(value).__name__}.")
-    return dict(value)
-
-
 def load_rollout_config(config_path: str) -> dict[str, Any]:
     """Load the shared Train/Rollout YAML configuration."""
-    resolved_path = Path(config_path).expanduser().resolve()
-    with resolved_path.open(encoding="utf-8") as config_file:
-        config = yaml.safe_load(config_file) or {}
-    if not isinstance(config, Mapping):
-        raise TypeError("The top-level YAML configuration must be a mapping.")
-    return dict(config)
+    return load_yaml_config(Path(config_path).expanduser().resolve())
 
 
 def _apply_environment(config: Mapping[str, Any]) -> None:
-    monarch_config = _require_mapping(config.get("monarch"), "monarch")
-    rollout_actor = _require_mapping(config.get("rollout_actor"), "rollout_actor")
+    monarch_config = mapping(config.get("monarch"), "monarch")
+    rollout_actor = mapping(config.get("rollout_actor"), "rollout_actor")
 
-    environment = _require_mapping(monarch_config.get("env"), "monarch.env")
-    environment.update(_require_mapping(rollout_actor.get("env"), "rollout_actor.env"))
+    environment = mapping(monarch_config.get("env"), "monarch.env")
+    environment.update(mapping(rollout_actor.get("env"), "rollout_actor.env"))
     for name, value in environment.items():
         os.environ[str(name)] = str(value)
 
 
 def _sequence_config(config: Mapping[str, Any]) -> dict[str, int]:
-    monarch_config = _require_mapping(config.get("monarch"), "monarch")
-    sequence = _require_mapping(monarch_config.get("sequence"), "monarch.sequence")
+    monarch_config = mapping(config.get("monarch"), "monarch")
+    sequence = mapping(monarch_config.get("sequence"), "monarch.sequence")
     prompt_length = int(sequence.get("max_prompt_tokens", 1024))
     response_length = int(sequence.get("max_response_tokens", 1024))
     if prompt_length <= 0 or response_length <= 0:
@@ -103,8 +91,8 @@ def _sequence_config(config: Mapping[str, Any]) -> dict[str, int]:
 
 
 def _build_engine_kwargs(config: Mapping[str, Any]) -> dict[str, Any]:
-    rollout_actor = _require_mapping(config.get("rollout_actor"), "rollout_actor")
-    engine_config = _require_mapping(
+    rollout_actor = mapping(config.get("rollout_actor"), "rollout_actor")
+    engine_config = mapping(
         rollout_actor.get("engine"), "rollout_actor.engine"
     )
     sequence = _sequence_config(config)
@@ -146,20 +134,20 @@ def _build_engine_kwargs(config: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _build_default_sampling_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    rollout_actor = _require_mapping(config.get("rollout_actor"), "rollout_actor")
+    rollout_actor = mapping(config.get("rollout_actor"), "rollout_actor")
     sequence = _sequence_config(config)
-    rollout_config = _require_mapping(
+    rollout_config = mapping(
         rollout_actor.get("rollout"), "rollout_actor.rollout"
     )
     if rollout_config:
-        sampling_config = _require_mapping(
+        sampling_config = mapping(
             rollout_config.get("sampling"), "rollout_actor.rollout.sampling"
         )
     else:
-        eval_config = _require_mapping(
+        eval_config = mapping(
             rollout_actor.get("eval"), "rollout_actor.eval"
         )
-        sampling_config = _require_mapping(
+        sampling_config = mapping(
             eval_config.get("sampling"), "rollout_actor.eval.sampling"
         )
 
@@ -296,7 +284,7 @@ class RolloutActor(Actor):
         if self._sampling_params_type is None:
             raise RuntimeError("RolloutActor.setup() must complete first.")
         sampling_config = dict(self._default_sampling_config)
-        sampling_config.update(_require_mapping(overrides, "sampling_params"))
+        sampling_config.update(mapping(overrides, "sampling_params"))
         params = self._sampling_params_type(**sampling_config)
         if int(params.max_tokens) > self._max_response_tokens:
             raise ValueError(
@@ -386,17 +374,17 @@ class RolloutActor(Actor):
             _apply_environment(config)
             engine_kwargs = _build_engine_kwargs(config)
             self._default_sampling_config = _build_default_sampling_config(config)
-            rl_config = _require_mapping(config.get("rl"), "rl")
-            rollout_actor = _require_mapping(
+            rl_config = mapping(config.get("rl"), "rl")
+            rollout_actor = mapping(
                 config.get("rollout_actor"), "rollout_actor"
             )
-            rollout_config = _require_mapping(
+            rollout_config = mapping(
                 rollout_actor.get("rollout"), "rollout_actor.rollout"
             )
             sequence = _sequence_config(config)
             self._max_prompt_tokens = sequence["max_prompt_tokens"]
             self._max_response_tokens = sequence["max_response_tokens"]
-            weight_sync_config = _require_mapping(
+            weight_sync_config = mapping(
                 rl_config.get("weight_sync"), "rl.weight_sync"
             )
             self._weight_transfer_packed = bool(

@@ -7,49 +7,16 @@ monarch:
     max_prompt_tokens: 2048
     max_response_tokens: 2048
   wandb:
-    enable: true
+    enable: false
     project: nano-agentic-rl
-    name: qwen3_1_7b_grpo
+    name: qwen3_1_7b_sft
     # entity: your_wandb_entity      # 可选
-    group: grpo-dapo               # 可选
-    tags: ["qwen3-1.7b", "grpo", "gsm8k"]  # 可选
-    mode: online                   # 可选，也可以 offline / disabled
-    dir: outputs/wandb             # 可选
+    group: sft-gsm8k                # 可选
+    tags: ["qwen3-1.7b", "sft", "gsm8k"]  # 可选
+    mode: online                    # 可选，也可以 offline / disabled
+    dir: outputs/wandb              # 可选
     gpu_sample_interval_seconds: 1.0
 
-
-rl:
-  # Controller-level GRPO settings. main_rl.py performs one rollout/train/sync cycle per step; SFT ignores this section.
-  max_steps: 1000
-  weight_sync:
-    # Trainer rank 0 broadcasts FSDP-gathered parameters directly to all vLLM workers.
-    backend: nccl
-    packed: true
-    packed_buffer_size_bytes: 536870912 # 512 MiB
-    packed_num_buffers: 2
-  rollout_batch_size: 4
-  rollout_batch_size_multiplier: 1.5
-  max_rollout_groups_per_step: 128
-  clip_low: 0.2
-  clip_high: 0.28
-  dynamic_sampling:
-    enabled: true
-    filter_low_variance_groups: true
-    filter_overlong_prompts: false
-    filter_overlong_responses: false
-  reward:
-    correctness_weight: 1.0
-    format_weight: 0.0
-    tolerance: 1.0e-6
-  advantage:
-    epsilon: 1.0e-6
-    minimum_group_std: 1.0e-3
-  replay_buffer:
-    capacity: 1024
-    max_policy_age: 0
-    consume_samples: true
-    mask_truncated: true
-    seed: 42
 
 
 dataloader:
@@ -92,8 +59,10 @@ train_actor:
     dyn_bsz: false
     micro_batch_size: 1
     global_batch_size: 32
-    num_train_epochs: 10
-    max_steps: 1000
+    # Stepwise SFT uses num_train_epochs * steps_per_epoch as the optimizer step count.
+    num_train_epochs: 3
+    # SFT ignores max_steps; GRPO uses rl.max_steps.
+    # max_steps: 1000
     init_device: meta
     seed: 42
     accelerator:
@@ -104,17 +73,19 @@ train_actor:
       offload_config:
         enable_activation: false
     gradient_checkpointing:
-      enable: true
+      enable: false
     optimizer:
       type: adamw
-      lr: 1.0e-6
-      lr_warmup_ratio: 0.0
-      lr_decay_style: constant
+      lr: 1.0e-5
+      lr_min: 1.0e-7
+      lr_start: 0.0
+      lr_warmup_ratio: 0.05
+      lr_decay_style: cosine
       lr_decay_ratio: 1.0
       weight_decay: 0.1
       max_grad_norm: 1.0
     checkpoint:
-      output_dir: outputs/exp_grpo
+      output_dir: outputs/qwen3_1_7b_gsm8k_sft
       save_steps: 0
       save_epochs: 0
       hf_save_steps: 0
@@ -146,19 +117,19 @@ rollout_actor:
       backend: nccl
     seed: 42
   
-  rollout: 
-    sampling:
-      n: 8    # grpo
-      temperature: 1.0
-      top_p: 0.95
-      logprobs: 1
+  # rollout: 
+  #   sampling:
+  #     n: 8    # grpo
+  #     temperature: 1.0
+  #     top_p: 0.95
+  #     logprobs: 1
   
   eval:
     eval_steps: 20
     eval_epochs: 1
     batch_size: 2048
     sampling:
-      n: 1   # 每个样本采样n次回答，统计pass@k指标
+      n: 1    # 每个样本采样n次回答，统计pass@k，g-pass@k指标
       temperature: 0.7
       top_p: 0.95
       logprobs: 0

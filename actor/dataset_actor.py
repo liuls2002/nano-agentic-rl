@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import yaml
 from monarch.actor import Actor, endpoint
 
+from actor.utils import load_yaml_config, mapping
 from rl.types import DatasetSample
 
 
@@ -24,14 +24,6 @@ class DatasetActorStatus:
     epoch: int
     cursor: int
     pad_token_id: int | None
-
-
-def _mapping(value: Any, name: str) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{name} must be a mapping.")
-    return dict(value)
 
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:
@@ -74,6 +66,26 @@ def _rollout_messages(messages: Any, path: Path) -> list[dict[str, str]]:
         normalized.append({"role": role, "content": content})
     if not any(message["role"] == "user" for message in normalized):
         raise ValueError(f"Dataset row has no user message: {path}")
+    return normalized
+
+
+def _teacher_messages(messages: Any, path: Path) -> list[dict[str, str]]:
+    if not isinstance(messages, list):
+        raise ValueError(f"Dataset row messages must be a list: {path}")
+    normalized = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            raise ValueError(f"Dataset row messages must contain mappings: {path}")
+        role = str(message.get("role", ""))
+        content = str(message.get("content", ""))
+        if role not in {"system", "user", "assistant", "tool"}:
+            raise ValueError(f"Unsupported message role {role!r}: {path}")
+        item = {"role": role, "content": content}
+        if "loss_mask" in message:
+            item["loss_mask"] = int(message["loss_mask"])
+        normalized.append(item)
+    if not any(message["role"] == "assistant" for message in normalized):
+        raise ValueError(f"Dataset row has no assistant message: {path}")
     return normalized
 
 
@@ -122,11 +134,10 @@ class DatasetActor(Actor):
         if self._rows:
             raise RuntimeError("DatasetActor.setup() may only be called once.")
 
-        with open(self.config_path, encoding="utf-8") as config_file:
-            config = yaml.safe_load(config_file) or {}
+        config = load_yaml_config(self.config_path)
 
-        dataloader = _mapping(config.get("dataloader"), "dataloader")
-        dataset_config = _mapping(
+        dataloader = mapping(config.get("dataloader"), "dataloader")
+        dataset_config = mapping(
             dataloader.get(self.dataset_name),
             f"dataloader.{self.dataset_name}",
         )
@@ -157,8 +168,8 @@ class DatasetActor(Actor):
 
     @staticmethod
     def _load_tokenizer(config: Mapping[str, Any]) -> Any:
-        train_actor = _mapping(config.get("train_actor"), "train_actor")
-        model = _mapping(train_actor.get("model"), "train_actor.model")
+        train_actor = mapping(config.get("train_actor"), "train_actor")
+        model = mapping(train_actor.get("model"), "train_actor.model")
         tokenizer_path = model.get("tokenizer_path") or model.get("model_path")
         if not tokenizer_path:
             raise ValueError(
@@ -196,6 +207,7 @@ class DatasetActor(Actor):
             prompt=_prompt_text(messages),
             target=str(row["label"]).strip(),
             messages=messages,
+            teacher_messages=_teacher_messages(row["messages"], self._path),
         )
 
     @endpoint

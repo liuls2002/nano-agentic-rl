@@ -8,8 +8,9 @@ from decimal import Decimal, DivisionByZero, InvalidOperation
 from pathlib import Path
 from typing import Any, Sequence
 
-import yaml
 from monarch.actor import Actor, endpoint
+
+from actor.utils import load_yaml_config
 
 
 logger = logging.getLogger(__name__)
@@ -41,8 +42,7 @@ class AdvantageResult:
 
 
 def _load_rl_config(config_path: str) -> dict[str, Any]:
-    with open(config_path, encoding="utf-8") as config_file:
-        config = yaml.safe_load(config_file) or {}
+    config = load_yaml_config(config_path)
     rl_config = config.get("rl", {})
     if rl_config is None:
         return {}

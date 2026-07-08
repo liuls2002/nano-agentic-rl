@@ -45,6 +45,7 @@ def grpo_loss(
     advantages: torch.Tensor,
     clip_low: float = 0.2,
     clip_high: float = 0.28,
+    normalizer: torch.Tensor | float | None = None,
 ) -> GRPOLossOutput:
     """Compute the clipped, token-level GRPO objective."""
     targets = create_shifted_targets(tokens, loss_mask)
@@ -57,7 +58,19 @@ def grpo_loss(
     )
 
     active_tokens = loss_mask.sum()
-    loss = (per_token_loss * loss_mask).sum() / active_tokens.clamp_min(1.0)
+    if normalizer is None:
+        denominator = active_tokens.clamp_min(1.0)
+    elif isinstance(normalizer, torch.Tensor):
+        denominator = normalizer.to(
+            device=per_token_loss.device, dtype=per_token_loss.dtype
+        ).clamp_min(1.0)
+    else:
+        denominator = torch.tensor(
+            max(float(normalizer), 1.0),
+            device=per_token_loss.device,
+            dtype=per_token_loss.dtype,
+        )
+    loss = (per_token_loss * loss_mask).sum() / denominator
 
     with torch.no_grad():
         active = loss_mask.bool()
