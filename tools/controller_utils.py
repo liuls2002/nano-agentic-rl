@@ -20,6 +20,11 @@ class EnvSetter(Actor):
     def set_env(self, env_vars: Mapping[str, str]) -> None:
         os.environ.update({str(key): str(value) for key, value in env_vars.items()})
 
+async def set_mesh_environment(
+    proc_mesh: ProcMesh, name: str, env_vars: Mapping[str, str]
+) -> None:
+    setter = proc_mesh.spawn(f"{name}_env", EnvSetter)
+    await setter.set_env.call(env_vars)
 
 def load_config(config_path: Path) -> dict[str, Any]:
     with config_path.open(encoding="utf-8") as config_file:
@@ -96,6 +101,97 @@ def summarize_lengths(lengths: Sequence[int]) -> dict[str, float]:
         "response_tokens_p95": float(sorted_lengths[p95_index]),
         "response_tokens_max": float(sorted_lengths[-1]),
     }
+
+
+class RolloutMetricsAccumulator:
+    """Collect rollout producer metrics between controller train steps."""
+
+    COUNT_KEYS = (
+        "requested_groups",
+        "processed_groups",
+        "accepted_groups",
+        "dynamic_sampling/dropped_low_variance_groups",
+        "dynamic_sampling/dropped_overlong_prompt_groups",
+        "dynamic_sampling/dropped_overlong_response_groups",
+        "dynamic_sampling/dropped_overlong_responses",
+        "dynamic_sampling/dropped_insufficient_sample_groups",
+        "generated_samples",
+        "truncated_samples",
+        "truncated_groups",
+        "accepted_samples",
+        "interrupted_groups",
+        "retried_groups",
+    )
+
+    def __init__(self) -> None:
+        self._totals = {key: 0.0 for key in self.COUNT_KEYS}
+        self._time_sec = 0.0
+        self._iterations = 0
+        self._reward_mean_weighted = 0.0
+        self._reward_std_weighted = 0.0
+        self._reward_weight = 0.0
+        self._response_token_lengths: list[int] = []
+
+    def add(self, metrics: Mapping[str, Any]) -> None:
+        self._iterations += 1
+        for key in self.COUNT_KEYS:
+            self._totals[key] += float_metric(metrics, key)
+        self._time_sec += float_metric(metrics, "time_sec")
+
+        reward_weight = float_metric(metrics, "accepted_groups")
+        if reward_weight > 0:
+            self._reward_mean_weighted += (
+                float_metric(metrics, "reward_mean") * reward_weight
+            )
+            self._reward_std_weighted += (
+                float_metric(metrics, "reward_std_mean") * reward_weight
+            )
+            self._reward_weight += reward_weight
+
+        lengths = metrics.get("response_token_lengths", ())
+        if isinstance(lengths, Sequence) and not isinstance(lengths, (str, bytes)):
+            self._response_token_lengths.extend(int(length) for length in lengths)
+
+    def snapshot(self) -> dict[str, float]:
+        result = dict(self._totals)
+        generated_samples = result["generated_samples"]
+        accepted_samples = result["accepted_samples"]
+        processed_groups = result["processed_groups"]
+        accepted_groups = result["accepted_groups"]
+        result.update(
+            {
+                "rollout_iterations": float(self._iterations),
+                "truncated_sample_rate": (
+                    result["truncated_samples"] / generated_samples
+                    if generated_samples
+                    else 0.0
+                ),
+                "effective_sample_rate": (
+                    accepted_samples / generated_samples if generated_samples else 0.0
+                ),
+                "effective_group_rate": (
+                    accepted_groups / processed_groups if processed_groups else 0.0
+                ),
+                "reward_mean": (
+                    self._reward_mean_weighted / self._reward_weight
+                    if self._reward_weight
+                    else 0.0
+                ),
+                "reward_std_mean": (
+                    self._reward_std_weighted / self._reward_weight
+                    if self._reward_weight
+                    else 0.0
+                ),
+                "time_sec": self._time_sec,
+                **summarize_lengths(self._response_token_lengths),
+            }
+        )
+        return result
+
+    def drain(self) -> dict[str, float]:
+        result = self.snapshot()
+        self.__init__()
+        return result
 
 
 def core_eval_wandb_metrics(eval_metrics: Mapping[str, Any]) -> dict[str, float]:
@@ -369,13 +465,6 @@ def reserve_local_port() -> tuple[str, int]:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return "127.0.0.1", int(sock.getsockname()[1])
-
-
-async def set_mesh_environment(
-    proc_mesh: ProcMesh, name: str, env_vars: Mapping[str, str]
-) -> None:
-    setter = proc_mesh.spawn(f"{name}_env", EnvSetter)
-    await setter.set_env.call(env_vars)
 
 
 async def run_eval(

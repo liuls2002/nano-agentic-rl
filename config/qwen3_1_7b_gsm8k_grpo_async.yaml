@@ -1,0 +1,165 @@
+monarch:
+  shutdown_timeout_seconds: 15
+  env:
+    # CUDA 13.0 machine has no IB device. All Monarch workers inherit this.
+    NCCL_IB_DISABLE: "1"
+  sequence:
+    max_prompt_tokens: 2048
+    max_response_tokens: 2048
+  wandb:
+    enable: true
+    project: nano-agentic-rl
+    name: qwen3_1_7b_grpo_async
+    # entity: your_wandb_entity      # 可选
+    group: grpo-dapo               # 可选
+    tags: ["qwen3-1.7b", "grpo", "gsm8k", "async"]  # 可选
+    mode: online                   # 可选，也可以 offline / disabled
+    dir: outputs/wandb             # 可选
+    gpu_sample_interval_seconds: 1.0
+
+
+rl:
+  # Controller-level GRPO settings. main_rl.py performs one rollout/train/sync cycle per step; SFT ignores this section.
+  max_steps: 1000
+  weight_sync:
+    # Trainer rank 0 broadcasts FSDP-gathered parameters directly to all vLLM workers.
+    backend: nccl
+    packed: true
+    packed_buffer_size_bytes: 536870912 # 512 MiB
+    packed_num_buffers: 2
+  rollout_batch_size: 4
+  rollout_batch_size_multiplier: 1.5
+  max_rollout_groups_per_step: 128
+  clip_low: 0.2
+  clip_high: 0.28
+  dynamic_sampling:
+    enabled: true
+    filter_low_variance_groups: true
+    filter_overlong_prompts: false
+    filter_overlong_responses: false
+  reward:
+    correctness_weight: 1.0
+    format_weight: 0.0
+    tolerance: 1.0e-6
+  advantage:
+    epsilon: 1.0e-6
+    minimum_group_std: 1.0e-3
+  replay_buffer:
+    capacity: 1024
+    max_policy_age: 1
+    consume_samples: true
+    mask_truncated: true
+    seed: 42
+
+
+dataloader:
+  train:
+    type: native
+    path: /ssd/liuls/projects/hw/nano-agentic-rl/data/train/gsm8k_train.jsonl
+    max_samples: -1   # -1表示取全部
+    datasets_type: mapping
+    data_type: conversation
+    chat_template: chatml
+    text_keys: messages
+    drop_last: true
+    pin_memory: true
+    shuffle: true
+  eval:
+    path: /ssd/liuls/projects/hw/nano-agentic-rl/data/val/gsm8k_val.jsonl
+    max_samples: -1
+    shuffle: false
+
+
+train_actor:
+  backend: veomni
+  num_gpus: 4
+  model:
+    model_path: /ssd/liuls/data/hub/Qwen3-1.7B-Base
+    tokenizer_path: /ssd/liuls/data/hub/Qwen3-1.7B-Base
+    ops_implementation:
+      attn_implementation: sdpa
+      moe_implementation: eager
+      cross_entropy_loss_implementation: eager
+      rms_norm_implementation: eager
+      swiglu_mlp_implementation: eager
+      rotary_pos_emb_implementation: eager
+      load_balancing_loss_implementation: eager
+      rms_norm_gated_implementation: eager
+      causal_conv1d_implementation: eager
+      chunk_gated_delta_rule_implementation: eager
+  
+  train:
+    dyn_bsz: false
+    micro_batch_size: 1
+    global_batch_size: 32
+    # Kept only for legacy VeOmni argument parsing. GRPO steps are controlled by rl.max_steps.
+    num_train_epochs: 1
+    max_steps: 1000
+    init_device: meta
+    seed: 42
+    accelerator:
+      fsdp_config:
+        fsdp_mode: fsdp2
+        mixed_precision:
+          enable: true
+      offload_config:
+        enable_activation: false
+    gradient_checkpointing:
+      enable: true
+    optimizer:
+      type: adamw
+      lr: 1.0e-6
+      lr_warmup_ratio: 0.0
+      lr_decay_style: constant
+      lr_decay_ratio: 1.0
+      weight_decay: 0.1
+      max_grad_norm: 1.0
+    checkpoint:
+      output_dir: outputs/exp_grpo
+      save_steps: 0
+      save_epochs: 0
+      hf_save_steps: 0
+      hf_save_epochs: 0
+      save_hf_weights: false
+    wandb:
+      enable: false
+
+
+rollout_actor:
+  backend: vllm
+  num_gpus: 2
+  colocate: False
+  
+  initial_policy_version: 0
+  engine:
+    data_parallel_size: 2
+    data_parallel_backend: mp
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    model: /ssd/liuls/data/hub/Qwen3-1.7B-Base  # 模型应该从trainer在线更新过来
+    tokenizer: /ssd/liuls/data/hub/Qwen3-1.7B-Base
+    load_format: dummy
+    dtype: bfloat16
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    # Enable vLLM's native NCCL receiver used by main_rl.py.
+    weight_transfer_config:
+      backend: nccl
+    seed: 42
+  
+  rollout: 
+    sampling:
+      n: 8    # grpo
+      temperature: 1.0
+      top_p: 0.95
+      logprobs: 1
+  
+  eval:
+    eval_steps: 20
+    eval_epochs: 1
+    batch_size: 2048
+    sampling:
+      n: 1   # 每个样本采样n次回答，统计pass@k指标
+      temperature: 0.7
+      top_p: 0.95
+      logprobs: 0

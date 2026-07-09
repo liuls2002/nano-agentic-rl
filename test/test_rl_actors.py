@@ -30,6 +30,7 @@ from actor.rollout_actor import RolloutActor
 from rl.loss import grpo_loss
 from rl.types import RLEpisode
 from tools.eval_metrics import compute_pass_at_k, compute_pass_at_k_range
+from tools.controller_utils import RolloutMetricsAccumulator
 
 
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "qwen3_1_7b_gsm8k_grpo.yaml"
@@ -101,6 +102,55 @@ def test_reward_answer_matching() -> None:
     assert reward_actor._evaluate("<answer>0.5</answer>", "1/2").reward == 1.0
     assert reward_actor._evaluate("\\boxed{0.5}", "1/2").reward == 0.0
     assert reward_actor._evaluate("Answer: 0.5", "1/2").reward == 0.0
+
+
+def test_rollout_metrics_accumulator() -> None:
+    accumulator = RolloutMetricsAccumulator()
+    empty = accumulator.snapshot()
+    assert empty["rollout_iterations"] == 0.0
+    assert empty["effective_sample_rate"] == 0.0
+    assert empty["response_tokens_p95"] == 0.0
+
+    accumulator.add(
+        {
+            "requested_groups": 2,
+            "processed_groups": 2,
+            "accepted_groups": 1,
+            "generated_samples": 8,
+            "accepted_samples": 4,
+            "truncated_samples": 2,
+            "reward_mean": 0.25,
+            "reward_std_mean": 0.4,
+            "time_sec": 3.0,
+            "response_token_lengths": [10, 20, 30, 40],
+        }
+    )
+    accumulator.add(
+        {
+            "requested_groups": 1,
+            "processed_groups": 1,
+            "accepted_groups": 1,
+            "generated_samples": 4,
+            "accepted_samples": 4,
+            "truncated_samples": 0,
+            "reward_mean": 0.75,
+            "reward_std_mean": 0.2,
+            "time_sec": 2.0,
+            "response_token_lengths": [50, 60],
+        }
+    )
+    metrics = accumulator.drain()
+    assert metrics["rollout_iterations"] == 2.0
+    assert metrics["requested_groups"] == 3.0
+    assert metrics["effective_sample_rate"] == 8 / 12
+    assert metrics["effective_group_rate"] == 2 / 3
+    assert metrics["truncated_sample_rate"] == 2 / 12
+    assert abs(metrics["reward_mean"] - 0.5) < 1e-12
+    assert abs(metrics["reward_std_mean"] - 0.3) < 1e-12
+    assert metrics["time_sec"] == 5.0
+    assert metrics["response_tokens_mean"] == 35.0
+    assert metrics["response_tokens_p95"] == 60.0
+    assert accumulator.snapshot()["rollout_iterations"] == 0.0
 
 
 async def test_nccl_receive_protocol(config_path: Path) -> None:
@@ -271,6 +321,7 @@ async def run_test(config_path: Path) -> None:
     test_grpo_loss()
     test_eval_metrics()
     test_reward_answer_matching()
+    test_rollout_metrics_accumulator()
     await test_nccl_receive_protocol(config_path)
     await test_expanded_sampling(config_path)
     host = this_host()
@@ -377,6 +428,7 @@ def run_local_test(config_path: Path) -> None:
     test_grpo_loss()
     test_eval_metrics()
     test_reward_answer_matching()
+    test_rollout_metrics_accumulator()
     asyncio.run(test_nccl_receive_protocol(config_path))
     asyncio.run(test_expanded_sampling(config_path))
     dataset = DatasetActor(str(config_path.resolve()), "train")
