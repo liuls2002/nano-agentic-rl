@@ -6,18 +6,9 @@ Nano-Agentic-RL 是一个基于 Monarch + VeOmni + vLLM 搭建的一个 agentic 
 
 ## Overview
 
-Nano-Agentic-RL 关注的是训练系统原型，而不是单个算法脚本。项目把数据、训练、推理、奖励、优势计算、replay buffer 和评估都抽象成 Monarch Actor，由 controller 用普通 Python 代码编排完整训练流程。
+Nano-Agentic-RL 关注的是训练系统原型，而不是单个算法脚本。项目把数据、训练、推理、奖励、优势计算、replay buffer 和评估都抽象成 Monarch Actor，由 controller 编排完整训练流程。
 
-```text
-                    Monarch Controller
-                            |
-        +-------------------+-------------------+
-        |                   |                   |
-  support actors       TrainActor mesh      RolloutActor
-        |                   |                   |
- Dataset / Reward      VeOmni + FSDP2       vLLM AsyncLLM
- Advantage / Replay    optimizer step       rollout / eval
-```
+![arch](./docs/imgs/arch.png)
 
 这个设计让训练侧和推理侧保持低耦合：VeOmni 专注模型训练，vLLM 专注高吞吐采样，Monarch 专注分布式进程、Actor 消息和控制流。SFT、同步 RL、异步 RL 共享同一批组件，只替换 controller 的调度策略。
 
